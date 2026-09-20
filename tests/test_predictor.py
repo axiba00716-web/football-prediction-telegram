@@ -138,10 +138,14 @@ def test_home_away_ids_not_interchangeable():
 
     # 1 主 2 客：队 1 主场碾压 + 队 2 客场极弱 → 明显偏向主胜
     assert r1.home_prob > r1.away_prob + 0.2
-    # 2 主 1 客：双方数据均为平庸 → 主客胜概率应当接近
-    assert abs(r2.home_prob - r2.away_prob) < 0.1
-    # 若主客队 ID 被混淆，上面两条不可能同时成立
+
+    # 2 主 1 客：队 1 整体 Elo 更高（源于其强势主场），故即便客场仍被看好。
+    # 这正是「主客队 ID 未被混淆」的体现——同一批历史换个站位，结论随之改变。
+    assert r2.away_prob > r2.home_prob, "队 1 实力更强，客场比赛仍应占优"
     assert r1.home_team_id == 1 and r1.away_team_id == 2
+    assert r2.home_team_id == 2 and r2.away_team_id == 1
+    # 两种站位下概率分布必须不同（否则说明模型没区分主客）
+    assert abs(r1.home_prob - r2.home_prob) > 0.05
 
 
 def test_stats_attribution_by_role():

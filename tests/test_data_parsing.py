@@ -198,3 +198,96 @@ class TestFootballAPI:
         assert api.api_key == "test-key"
         assert api.base_url.startswith("http")
         assert api.timeout > 0
+
+
+# ---------- 赛季回退（免费套餐只开放 2022–2024）----------
+
+def test_season_candidates_cover_free_plan_seasons():
+    """候选赛季必须覆盖免费套餐可用的 2022/2023/2024。"""
+    from app.data import FREE_PLAN_SEASONS, _season_candidates
+
+    cands = _season_candidates()
+    for s in FREE_PLAN_SEASONS:
+        assert s in cands, f"赛季 {s} 未在候选列表中，免费套餐将无数据可用"
+
+
+def test_team_fixtures_falls_back_to_available_season(monkeypatch):
+    """当前赛季被拒绝时，应自动回退到可用赛季而不是直接失败。"""
+    import asyncio
+
+    import app.data as data_mod
+    from app.data import FootballAPIError, set_working_season, team_fixtures
+
+    set_working_season(None)  # 清空缓存，强制走探测流程
+    tried = []
+
+    def fake(path, params, api_key, base_url, timeout=None):
+        season = params.get("season")
+        tried.append(season)
+        if season in (2026, 2025):
+            raise FootballAPIError("免费方案无权限访问该赛季，建议使用 2022-2024")
+        if season == 2024:
+            return {"response": [
+                {"fixture": {"id": 1, "date": "2024-05-01T15:00:00+00:00",
+                             "status": {"short": "FT"}},
+                 "league": {"id": 39, "name": "EPL"},
+                 "teams": {"home": {"id": 33, "name": "A"},
+                           "away": {"id": 34, "name": "B"}},
+                 "goals": {"home": 2, "away": 1}},
+            ]}
+        return {"response": []}
+
+    monkeypatch.setattr(data_mod, "_http_get", fake)
+    rows = asyncio.run(team_fixtures(33, last=20))
+
+    assert tried == [2026, 2025, 2024], f"应依次尝试并停在可用赛季，实际 {tried}"
+    assert len(rows) == 1
+
+
+def test_working_season_is_cached_for_later_teams(monkeypatch):
+    """首个球队探测成功后，后续球队直接复用赛季，避免重复消耗配额。"""
+    import asyncio
+
+    import app.data as data_mod
+    from app.data import FootballAPIError, get_working_season, set_working_season, team_fixtures
+
+    set_working_season(None)
+    calls = []
+
+    def fake(path, params, api_key, base_url, timeout=None):
+        season = params.get("season")
+        calls.append(season)
+        if season in (2026, 2025):
+            raise FootballAPIError("无权限")
+        return {"response": [
+            {"fixture": {"id": 1, "date": "2024-05-01T15:00:00+00:00",
+                         "status": {"short": "FT"}},
+             "league": {"id": 39, "name": "EPL"},
+             "teams": {"home": {"id": 33, "name": "A"},
+                       "away": {"id": 34, "name": "B"}},
+             "goals": {"home": 2, "away": 1}},
+        ]}
+
+    monkeypatch.setattr(data_mod, "_http_get", fake)
+    asyncio.run(team_fixtures(33, last=20))
+    assert get_working_season() == 2024
+
+    calls.clear()
+    asyncio.run(team_fixtures(34, last=20))
+    assert calls == [2024], f"第二支球队应直接用缓存赛季，实际请求了 {calls}"
+
+
+def test_team_fixtures_returns_empty_when_no_season_available(monkeypatch):
+    """所有赛季都不可访问时返回空列表，不能抛异常。"""
+    import asyncio
+
+    import app.data as data_mod
+    from app.data import FootballAPIError, set_working_season, team_fixtures
+
+    set_working_season(None)
+    monkeypatch.setattr(
+        data_mod, "_http_get",
+        lambda path, params, api_key, base_url, timeout=None: (_ for _ in ()).throw(
+            FootballAPIError("全部赛季无权限")),
+    )
+    assert asyncio.run(team_fixtures(33, last=20)) == []

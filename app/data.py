@@ -218,24 +218,42 @@ class FootballAPI:
         因此改用 ``season`` 拉取整季数据，再在本地按开赛时间降序截取。
 
         * 默认**不按联赛过滤**：杯赛/跨联赛历史同样要能被预测器使用；
-        * 只保留已结束场次（FT/AET/PEN），未结束的不算历史。
+        * 只保留已结束场次（FT/AET/PEN），未结束的不算历史；
+        * **赛季自动回退**：免费套餐可能不包含当前赛季（如 2026），
+          此时自动向前尝试更早的赛季，直到拿到已结束的比赛。
         """
         if not team_id:
             return []
-        if season is None:
-            season = current_season()
 
-        data = await self.request(
-            "/fixtures", {"team": int(team_id), "season": int(season)}
-        )
-        rows = self._rows(data, allowed_leagues)
+        global _WORKING_SEASON
+        # 配额策略：首个球队负责「探测」可用赛季（最多 SEASON_PROBE_LIMIT 次），
+        # 成功后写入全局缓存，后续所有球队直接命中缓存赛季 → 每队仅 1 次请求。
+        limit = None if _WORKING_SEASON is not None else SEASON_PROBE_LIMIT
+        tried = 0
+        for candidate in _season_candidates(season):
+            if limit is not None and tried >= limit:
+                logger.warning(
+                    "赛季探测已达上限(%d)，仍未找到可用赛季（免费套餐通常仅开放 2022-2024）",
+                    limit,
+                )
+                break
+            try:
+                data = await self.request(
+                    "/fixtures", {"team": int(team_id), "season": int(candidate)}
+                )
+            except FootballAPIError:
+                tried += 1
+                continue  # 该赛季不可访问（如免费套餐的 2026）→ 试上一个赛季
+            rows = self._rows(data, allowed_leagues)
+            finished = [r for r in rows if _is_finished_status(r.get("status"))]
+            if not finished:
+                continue
+            # 该赛季可用 → 全局记住，后续球队不再重复探测
+            _WORKING_SEASON = int(candidate)
+            finished.sort(key=lambda r: r.get("start_time") or datetime.min, reverse=True)
+            return finished[: max(1, int(last))]
 
-        finished = [r for r in rows if _is_finished_status(r.get("status"))]
-        if not finished:
-            return []
-
-        finished.sort(key=lambda r: r.get("start_time") or datetime.min, reverse=True)
-        return finished[: max(1, int(last))]
+        return []  # 所有可访问赛季都没有已结束比赛
 
     # -- 工具 ------------------------------------------------------------- #
 
@@ -248,6 +266,46 @@ class FootballAPI:
             if parsed and parsed["external_id"]:
                 out.append(parsed)
         return out
+
+
+# API-Football 免费套餐开放的赛季范围（官方报错原文提示：建议使用 2022–2024）
+FREE_PLAN_SEASONS = (2024, 2023, 2022)
+SEASON_FALLBACK_YEARS = 6      # 从当前赛季最多向前回溯几个赛季（确保覆盖到 2022）
+SEASON_PROBE_LIMIT = 6         # 首队探测赛季时的最大尝试次数（0/None=不限）
+
+# 全局缓存：一旦某个赛季被验证可用，后续所有球队直接复用，不再重复探测
+_WORKING_SEASON: Optional[int] = None
+
+
+def set_working_season(season: Optional[int]) -> None:
+    """手动指定可用赛季（测试或用户已知时调用）。"""
+    global _WORKING_SEASON
+    _WORKING_SEASON = int(season) if season else None
+
+
+def get_working_season() -> Optional[int]:
+    """返回已验证可用的赛季；尚未探测则为 None。"""
+    return _WORKING_SEASON
+
+
+def _season_candidates(season: Optional[int] = None) -> list[int]:
+    """生成待尝试的赛季列表。
+
+    免费套餐只开放 2022–2024（API 会直接报错「无权限访问当前赛季」），
+    因此候选顺序为：当前赛季 → 逐年回溯 → 免费赛季兜底，
+    并保证 2022/2023/2024 一定在列表里。
+    """
+    if season is not None:
+        return [int(season)]
+    if _WORKING_SEASON is not None:
+        return [int(_WORKING_SEASON)]
+
+    base = current_season()
+    seen: list[int] = []
+    for s in [base - i for i in range(SEASON_FALLBACK_YEARS)] + list(FREE_PLAN_SEASONS):
+        if s not in seen:
+            seen.append(s)
+    return seen
 
 
 def current_season(today: Optional[date] = None) -> int:
@@ -505,5 +563,6 @@ __all__ = [
     "to_utc_naive", "from_utc_naive",
     "fixtures_by_date", "team_fixtures", "upsert_fixtures",
     "sync_date", "sync_local_date", "sync_team_history", "sync_team_fixtures",
-    "current_season", "clear_history_cache",
+    "current_season", "_season_candidates", "clear_history_cache",
+    "set_working_season", "get_working_season", "FREE_PLAN_SEASONS",
 ]

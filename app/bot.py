@@ -93,6 +93,41 @@ def render_table(headers: list[str], rows: list[list], aligns: list[str] | None 
     return "\n".join(lines)
 
 
+def render_fixture_cards(rows: list[list]) -> str:
+    """赛程卡片：两行一场，**不依赖列对齐**。
+
+    中文在 Telegram 等宽字体下宽度不 guaranteed 为 2 列，
+    用空格 padding 做表格必然错位；改为「时间·联赛 / 对阵」两行结构，
+    任何字体下都整齐。
+    """
+    if not rows:
+        return ""
+    blocks = []
+    for r in rows:
+        when, league, matchup = (list(r) + ["", "", ""])[:3]
+        line1 = " · ".join(x for x in (when, league) if x)
+        blocks.append(f"{line1}\n{matchup}" if line1 else matchup)
+    return "\n\n".join(blocks)
+
+
+def render_prediction_cards(rows: list[list], details: list[str],
+                            unavailable: list[str]) -> str:
+    """预测卡片：一场三行，同样不依赖列对齐。"""
+    parts = []
+    for r in rows:
+        matchup, hp, dp, ap, score, conf = (list(r) + [""] * 6)[:6]
+        parts.append(
+            f"{matchup}\n"
+            f"主 {hp} · 平 {dp} · 客 {ap}\n"
+            f"比分 {score} · 置信 {conf}"
+        )
+    if details:
+        parts.append("预测依据\n" + "\n".join(details))
+    if unavailable:
+        parts.append("未能预测\n" + "\n".join(f"· {u}" for u in unavailable))
+    return "\n\n".join(parts)
+
+
 def _code_block(text: str) -> str:
     """包裹为 Telegram 等宽代码块（内容转义，``` 标记保持原样）。"""
     return "```\n" + _escape_md(text) + "\n```"
@@ -231,21 +266,20 @@ async def _sync_and_show(update: Update, target: date) -> None:
         return
 
     tzname = get_settings().TIMEZONE
-    table_rows = [
+    card_rows = [
         [_local_time_text(getattr(f, "start_time", None)),
-         _ellipsis(f.league or "-", 10),
-         f"{_ellipsis(f.home or '?', 12)} vs {_ellipsis(f.away or '?', 12)}"]
+         _ellipsis(f.league or "-", 12),
+         f"{_ellipsis(f.home or '?', 14)} vs {_ellipsis(f.away or '?', 14)}"]
         for f in rows
     ]
-    header = f"📅 {target.isoformat()} 比赛（{len(rows)} 场，时间为 {tzname}）"
+    header = f"📅 {target.isoformat()} · {len(rows)} 场（{tzname}）"
 
-    # 按批发送，保证单个代码块不会被截断
-    for i in range(0, len(table_rows), TABLE_BATCH):
-        batch = table_rows[i:i + TABLE_BATCH]
-        body = render_table(["时间", "联赛", "对阵"], batch,
-                            aligns=["left", "left", "left"])
+    # 按批发送，避免单条消息超长
+    for i in range(0, len(card_rows), TABLE_BATCH):
+        batch = card_rows[i:i + TABLE_BATCH]
+        body = render_fixture_cards(batch)
         prefix = header if i == 0 else None
-        text = (_escape_md(prefix) + "\n" if prefix else "") + _code_block(body)
+        text = (_escape_md(prefix) + "\n\n" if prefix else "") + _code_block(body)
         await _reply(update, text, markdown=True)
 
 
@@ -409,19 +443,13 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         details.append(f"• {matchup}：{result.evidence}")
 
     if table_rows:
-        header = f"📊 {target.isoformat()} 预测（{len(table_rows)} 场）"
-        body = render_table(
-            ["对阵", "主胜", "平", "客胜", "比分", "置信"],
-            table_rows,
-            aligns=["left", "right", "right", "right", "center", "center"],
-        )
-        text = _escape_md(header) + "\n" + _code_block(body)
-        if details:
-            text += "\n\n预测依据\n" + "\n".join(_escape_md(d) for d in details)
+        header = f"📊 {target.isoformat()} 预测 · {len(table_rows)} 场"
+        body = render_prediction_cards(table_rows, details, unavailable)
+        text = _escape_md(header) + "\n\n" + _code_block(body)
         text += "\n\n" + DISCLAIMER
         await _reply(update, text, markdown=True)
 
-    if unavailable:
+    if not table_rows and unavailable:
         await _reply(update, "⚠️ 未能预测：\n" + "\n".join(f"• {u}" for u in unavailable))
 
     if not table_rows and not unavailable:
@@ -528,7 +556,7 @@ def run_polling(drop_pending_updates: bool = True) -> None:
 
 
 __all__ = [
-    "start", "help_command", "today", "tomorrow", "predict", "status",
+    "render_fixture_cards", "render_prediction_cards", "start", "help_command", "today", "tomorrow", "predict", "status",
     "register_handlers", "build_application", "run_polling",
     "today_local", "DISCLAIMER", "FINISHED_STATUSES",
     "BOT_COMMANDS", "_set_bot_commands",
