@@ -151,6 +151,10 @@ def _escape_md(text: str) -> str:
 # 限制单轮预测场次，避免一次 /predict 就把当天配额打光。
 MAX_PREDICT_FIXTURES = 8
 
+# 版本标记：每次改动 +1，用于确认线上跑的到底是哪一版代码。
+# Railway 自动部署经常不触发，有了它 /status 一眼就能看出来。
+BUILD_TAG = "build-2026.09.20-e"
+
 try:
     import telegram as _tg_probe
     _HAS_TELEGRAM = True
@@ -774,9 +778,17 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     finally:
         session.close()
 
+    try:
+        from app.data import get_working_season
+        season_text = get_working_season() or "尚未探测"
+    except Exception:  # noqa: BLE001
+        season_text = "未知"
+
     await _reply(update, (
         "✅ 机器人运行中（polling 模式）\n"
+        f"代码版本: {BUILD_TAG}\n"
         f"模型版本: {MODEL_VERSION}\n"
+        f"历史赛季: {season_text}（免费套餐仅 2022-2024）\n"
         f"数据库状态: {db_state}\n"
         f"比赛(Fixture)数量: {n_fixtures}\n"
         f"预测(Prediction)数量: {n_predictions}\n"
@@ -880,7 +892,7 @@ def run_polling(drop_pending_updates: bool = True) -> None:
 
 
 __all__ = [
-    "render_fixture_cards", "render_prediction_cards", "start", "help_command", "today", "tomorrow", "predict", "status",
+    "render_fixture_cards", "render_prediction_cards", "start", "BUILD_TAG", "help_command", "today", "tomorrow", "predict", "status",
     "register_handlers", "build_application", "run_polling",
     "today_local", "DISCLAIMER", "FINISHED_STATUSES",
     "BOT_COMMANDS", "_set_bot_commands",
