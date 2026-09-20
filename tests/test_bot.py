@@ -43,7 +43,7 @@ def _seed_today_fixture(session, fixture_pk=1, home_id=101, away_id=202):
         league="EPL", league_id=39,
         start_time=datetime(2026, 9, 20, 15, 0, 0),
         home_team_id=home_id, away_team_id=away_id,
-        home="Home FC", away="Away FC", status="NS",
+        home="Arsenal", away="Chelsea", status="NS",
     )
     session.add(f)
     session.commit()
@@ -100,11 +100,13 @@ def test_predict_uses_real_team_ids(monkeypatch):
 
     # 关键：传给 sync_team_history 的是真实球队 ID，绝不能是 Fixture.id
     assert seen_ids == [101, 202]
-    assert fix.id not in seen_ids
+    assert fix.id not in seen_ids, "绝不能把 Fixture.id 当球队 ID 使用"
 
     body = "\n".join(update.message.texts)
-    assert "101" in body and "202" in body, "预测依据应体现真实球队 ID"
+    assert "Arsenal" in body and "Chelsea" in body
     assert "仅供数据分析参考，不构成投注建议。" in body
+    # 输出应为表格（等宽代码块）
+    assert any("```" in t for t in update.message.texts), "预测结果应以表格代码块呈现"
 
 
 def test_predict_missing_team_id_reports_unavailable(monkeypatch):

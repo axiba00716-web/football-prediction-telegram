@@ -168,7 +168,10 @@ class TestSyncTeamHistory:
         monkeypatch.setattr(FootballAPI, "_request", fake_request)
         written = asyncio.run(sync_team_history(33, last=20))
 
-        assert seen.get("team") == 33 and seen.get("last") == 20
+        assert seen.get("team") == 33
+        # 免费套餐不支持 last 参数，改用 season 拉取整季后本地截取
+        assert "last" not in seen, "API-Football 免费套餐不支持 last 参数"
+        assert seen.get("season") is not None
         assert written == 2, "跨联赛历史不应被 ENABLED_LEAGUES 过滤掉"
 
     def test_zero_team_id_is_noop(self):

@@ -217,8 +217,8 @@ def predict_match(
     confidence = _confidence(home_prob, draw_prob, away_prob, total_games)
 
     evidence = (
-        f"主队(home_id={home_team_id}) 近 {h_n} 个主场 进{h_gf:.0f} 失{h_ga:.0f}；"
-        f"客队(away_id={away_team_id}) 近 {a_n} 个客场 进{a_gf:.0f} 失{a_ga:.0f}；"
+        f"主队近 {h_n} 个主场 进{h_gf:.0f} 失{h_ga:.0f}；"
+        f"客队近 {a_n} 个客场 进{a_gf:.0f} 失{a_ga:.0f}；"
         f"期望进球 {lambda_home:.2f} - {lambda_away:.2f}。"
     )
 

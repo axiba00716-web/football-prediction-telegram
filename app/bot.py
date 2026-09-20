@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import unicodedata
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -34,6 +35,78 @@ logger = logging.getLogger(__name__)
 
 DISCLAIMER = "仅供数据分析参考，不构成投注建议。"
 TELEGRAM_MSG_LIMIT = 3500  # Telegram 上限 4096，留余量
+# 赛程/预测表格每批最多几行：控制单条消息长度，避免代码块被截断
+TABLE_BATCH = 20
+
+
+def _display_width(text: str) -> int:
+    """按等宽字体显示宽度计算（中日韩字符占 2 列，保证对齐）。"""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+               for ch in str(text))
+
+
+def _pad(text: str, width: int, align: str = "left") -> str:
+    """按显示宽度补齐到指定列宽。"""
+    text = str(text)
+    gap = width - _display_width(text)
+    if gap <= 0:
+        return text
+    if align == "right":
+        return " " * gap + text
+    if align == "center":
+        left = gap // 2
+        return " " * left + text + " " * (gap - left)
+    return text + " " * gap
+
+
+def _ellipsis(text: str, max_width: int) -> str:
+    """按显示宽度截断，超长加省略号。"""
+    text = str(text)
+    if _display_width(text) <= max_width:
+        return text
+    out, cur = "", 0
+    for ch in text:
+        w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if cur + w > max_width - 1:
+            break
+        out += ch
+        cur += w
+    return out + "…"
+
+
+def render_table(headers: list[str], rows: list[list], aligns: list[str] | None = None) -> str:
+    """生成等宽文本表格（配合 Telegram Markdown 代码块显示为表格）。"""
+    if not headers or not rows:
+        return ""
+    n = len(headers)
+    aligns = aligns or ["left"] * n
+    cells = [[str(c) for c in list(r)[:n]] + [""] * max(0, n - len(r)) for r in rows]
+    widths = [
+        max(_display_width(headers[i]),
+            max((_display_width(c[i]) for c in cells), default=0))
+        for i in range(n)
+    ]
+    line_sep = "  ".join("-" * w for w in widths)
+    lines = ["  ".join(_pad(headers[i], widths[i], "center") for i in range(n)), line_sep]
+    for c in cells:
+        lines.append("  ".join(_pad(c[i], widths[i], aligns[i]) for i in range(n)))
+    return "\n".join(lines)
+
+
+def _code_block(text: str) -> str:
+    """包裹为 Telegram 等宽代码块（内容转义，``` 标记保持原样）。"""
+    return "```\n" + _escape_md(text) + "\n```"
+
+
+def _escape_md(text: str) -> str:
+    """Markdown 模式下转义易破坏解析的字符。"""
+    for ch in ("_", "*", "`", "["):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+# API-Football 免费套餐 100 次/天，每支球队的历史需 1 次请求，
+# 限制单轮预测场次，避免一次 /predict 就把当天配额打光。
+MAX_PREDICT_FIXTURES = 8
 
 # 已结束状态（与 predictor / data 保持一致）
 FINISHED_STATUSES = ["FT", "AET", "PEN", "finished", "Match Finished"]
@@ -56,8 +129,8 @@ def today_local() -> date:
 # 消息工具
 # --------------------------------------------------------------------------- #
 
-async def _reply(update: Update, text: str) -> None:
-    """超长消息自动分段发送，避免超过 Telegram 单条长度限制。"""
+async def _reply(update: Update, text: str, markdown: bool = False) -> None:
+    """超长消息自动分段发送；Markdown 解析失败时自动回退纯文本。"""
     if not text:
         return
     parts: list[str] = []
@@ -72,6 +145,12 @@ async def _reply(update: Update, text: str) -> None:
         parts.append(remaining[:cut])
         remaining = remaining[cut:].lstrip("\n")
     for p in parts:
+        if markdown:
+            try:
+                await update.message.reply_text(p, parse_mode="Markdown")
+                continue
+            except Exception:  # noqa: BLE001 - Markdown 解析失败则降级
+                logger.warning("Markdown 发送失败，回退纯文本")
         await update.message.reply_text(p)
 
 
@@ -151,9 +230,22 @@ async def _sync_and_show(update: Update, target: date) -> None:
         return
 
     tzname = get_settings().TIMEZONE
-    lines = [f"📅 {target.isoformat()} 比赛（{len(rows)} 场，时间为 {tzname}）："]
-    lines.extend(_fmt_fixture(f) for f in rows)
-    await _reply(update, "\n".join(lines))
+    table_rows = [
+        [_local_time_text(getattr(f, "start_time", None)),
+         _ellipsis(f.league or "-", 10),
+         f"{_ellipsis(f.home or '?', 12)} vs {_ellipsis(f.away or '?', 12)}"]
+        for f in rows
+    ]
+    header = f"📅 {target.isoformat()} 比赛（{len(rows)} 场，时间为 {tzname}）"
+
+    # 按批发送，保证单个代码块不会被截断
+    for i in range(0, len(table_rows), TABLE_BATCH):
+        batch = table_rows[i:i + TABLE_BATCH]
+        body = render_table(["时间", "联赛", "对阵"], batch,
+                            aligns=["left", "left", "left"])
+        prefix = header if i == 0 else None
+        text = (_escape_md(prefix) + "\n" if prefix else "") + _code_block(body)
+        await _reply(update, text, markdown=True)
 
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -251,48 +343,88 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, "今日无配置联赛的比赛，暂无可预测项。")
         return
 
-    blocks: list[str] = []
+    total_fixtures = len(fixtures)
+    if total_fixtures > MAX_PREDICT_FIXTURES:
+        fixtures = fixtures[:MAX_PREDICT_FIXTURES]
+        notice = (
+            f"当日共 {total_fixtures} 场比赛，"
+            f"受 API 免费额度限制，本次只预测前 {MAX_PREDICT_FIXTURES} 场。\n\n"
+        )
+    else:
+        notice = ""
+
+    # 先把当天涉及的球队去重批量同步历史（内部有缓存，每队只请求一次）
+    team_ids: list[int] = []
+    for fix in fixtures:
+        for tid in (fix.home_team_id, fix.away_team_id):
+            if tid and tid not in team_ids:
+                team_ids.append(tid)
+
+    sync_errors: dict[int, str] = {}
+    for tid in team_ids:
+        try:
+            await sync_team_history(tid, last=20)
+        except FootballAPIError as e:
+            sync_errors[tid] = str(e)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("sync_team_history 异常")
+            sync_errors[tid] = str(e)
+
+    table_rows: list[list] = []
+    details: list[str] = []
+    unavailable: list[str] = []
+
     for fix in fixtures:
         home_id = fix.home_team_id
         away_id = fix.away_team_id
+        matchup = f"{_ellipsis(fix.home or '?', 9)} vs {_ellipsis(fix.away or '?', 9)}"
 
         # 球队 ID 缺失 → 明确告知无法预测，绝不用 fix.id 顶替
         if not home_id or not away_id:
-            blocks.append(
-                f"⚠️ {fix.home} vs {fix.away}：缺少真实球队 ID"
-                f"（home={home_id}, away={away_id}），无法可靠预测。"
-            )
+            unavailable.append(f"{matchup}：缺少真实球队 ID，无法可靠预测")
             continue
 
-        try:
-            await sync_team_history(home_id, last=20)
-            await sync_team_history(away_id, last=20)
-        except FootballAPIError as e:
-            blocks.append(f"⚠️ {fix.home} vs {fix.away}：历史同步失败 - {e}")
-            continue
-        except Exception as e:  # noqa: BLE001
-            logger.exception("sync_team_history 异常")
-            blocks.append(f"⚠️ {fix.home} vs {fix.away}：历史同步异常 - {e}")
+        failed = sync_errors.get(home_id) or sync_errors.get(away_id)
+        if failed:
+            unavailable.append(f"{matchup}：历史同步失败 - {failed}")
             continue
 
         history = _history_from_db(home_id, away_id)
         result = predict_match(home_id, away_id, history)
 
         if result is None:
-            blocks.append(
-                f"📊 {fix.home} vs {fix.away}\n"
-                "历史样本不足，暂不提供可靠预测。"
-            )
+            unavailable.append(f"{matchup}：历史样本不足，暂不提供可靠预测")
             continue
 
         _save_prediction(fix, result)
-        blocks.append(
-            f"📊 {fix.home} vs {fix.away}\n"
-            f"{format_prediction(result)}\n"
-            f"{DISCLAIMER}"
-        )
+        table_rows.append([
+            matchup,
+            f"{round(result.home_prob * 100)}%",
+            f"{round(result.draw_prob * 100)}%",
+            f"{round(result.away_prob * 100)}%",
+            result.predicted_score,
+            result.confidence,
+        ])
+        details.append(f"• {matchup}：{result.evidence}")
 
-    await _reply(update, "\n\n".join(blocks))
+    if table_rows:
+        header = f"📊 {target.isoformat()} 预测（{len(table_rows)} 场）"
+        body = render_table(
+            ["对阵", "主胜", "平", "客胜", "比分", "置信"],
+            table_rows,
+            aligns=["left", "right", "right", "right", "center", "center"],
+        )
+        text = _escape_md(header) + "\n" + _code_block(body)
+        if details:
+            text += "\n\n预测依据\n" + "\n".join(_escape_md(d) for d in details)
+        text += "\n\n" + DISCLAIMER
+        await _reply(update, text, markdown=True)
+
+    if unavailable:
+        await _reply(update, "⚠️ 未能预测：\n" + "\n".join(f"• {u}" for u in unavailable))
+
+    if not table_rows and not unavailable:
+        await _reply(update, notice.strip() or "今日无可预测项。")
 
 
 # --------------------------------------------------------------------------- #

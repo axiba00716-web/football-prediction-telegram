@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
@@ -206,15 +207,35 @@ class FootballAPI:
         return self._rows(data, allowed or None)
 
     async def team_fixtures(self, team_id: int, last: int = 20,
-                            allowed_leagues: Optional[set[int]] = None) -> list[dict]:
-        """``GET /fixtures?team=<id>&last=<n>``。
+                            allowed_leagues: Optional[set[int]] = None,
+                            season: Optional[int] = None) -> list[dict]:
+        """获取某队近期比赛，返回最近 ``last`` 场**已结束**的比赛。
 
-        默认**不按联赛过滤**：球队历史可能来自杯赛/其他联赛，必须能被预测器使用。
+        实现说明（重要）
+        --------------
+        API-Football **免费套餐不支持 ``last`` 参数**（会返回
+        ``Free plans do not have access to the Last parameter``），
+        因此改用 ``season`` 拉取整季数据，再在本地按开赛时间降序截取。
+
+        * 默认**不按联赛过滤**：杯赛/跨联赛历史同样要能被预测器使用；
+        * 只保留已结束场次（FT/AET/PEN），未结束的不算历史。
         """
         if not team_id:
             return []
-        data = await self.request("/fixtures", {"team": int(team_id), "last": int(last)})
-        return self._rows(data, allowed_leagues)
+        if season is None:
+            season = current_season()
+
+        data = await self.request(
+            "/fixtures", {"team": int(team_id), "season": int(season)}
+        )
+        rows = self._rows(data, allowed_leagues)
+
+        finished = [r for r in rows if _is_finished_status(r.get("status"))]
+        if not finished:
+            return []
+
+        finished.sort(key=lambda r: r.get("start_time") or datetime.min, reverse=True)
+        return finished[: max(1, int(last))]
 
     # -- 工具 ------------------------------------------------------------- #
 
@@ -227,6 +248,18 @@ class FootballAPI:
             if parsed and parsed["external_id"]:
                 out.append(parsed)
         return out
+
+
+def current_season(today: Optional[date] = None) -> int:
+    """推断当前足球赛季年份。
+
+    欧洲主流联赛跨年（约 8 月开赛、次年 5 月结束）：
+    * 7 月及以后 → 属于当年开始的赛季（2026-09 → 2026）
+    * 6 月及以前 → 属于上一年开始的赛季（2026-03 → 2025）
+    """
+    if today is None:
+        today = datetime.now(get_timezone()).date()
+    return today.year if today.month >= 7 else today.year - 1
 
 
 def _parse_fixture(item: dict, allowed_leagues: Optional[set[int]] = None) -> Optional[dict]:
@@ -426,16 +459,39 @@ async def sync_date(target: date) -> tuple[int, list[dict]]:
     return written, result
 
 
+# 球队历史缓存：{team_id: (过期时间戳, rows)}
+# 免费套餐只有 100 次/天，/predict 会对每支球队发一次请求，
+# 同一支球队在当天多次预测时复用缓存，避免把配额一次打光。
+_HISTORY_CACHE: dict[int, tuple[float, list[dict]]] = {}
+HISTORY_CACHE_TTL = 30 * 60  # 30 分钟
+
+
+def clear_history_cache() -> None:
+    """清空历史缓存（测试或强制刷新时使用）。"""
+    _HISTORY_CACHE.clear()
+
+
 async def sync_team_history(team_id: int, last: int = 20) -> int:
     """同步某队近期比赛，返回写入/更新条数。
 
     说明：
+    * 用 ``season`` 参数拉取（免费套餐不支持 ``last``），本地截取最近
+      ``last`` 场**已结束**比赛；
     * 不按联赛过滤，保证杯赛/跨联赛历史也能被预测器使用；
-    * 未结束（NS/TBD/…）的比赛同样入库，但预测器只统计已结束场次。
+    * 带 30 分钟进程内缓存，重复调用不额外消耗 API 配额。
     """
     if not team_id:
         return 0
-    rows = await team_fixtures(team_id, last=last)
+
+    now = time.time()
+    cached = _HISTORY_CACHE.get(int(team_id))
+    if cached is not None and cached[0] > now:
+        rows = cached[1]
+    else:
+        rows = await team_fixtures(team_id, last=last)
+        _HISTORY_CACHE[int(team_id)] = (now + HISTORY_CACHE_TTL, rows)
+
+    return upsert_fixtures(rows)
     return upsert_fixtures(rows)
 
 
@@ -449,4 +505,5 @@ __all__ = [
     "to_utc_naive", "from_utc_naive",
     "fixtures_by_date", "team_fixtures", "upsert_fixtures",
     "sync_date", "sync_local_date", "sync_team_history", "sync_team_fixtures",
+    "current_season", "clear_history_cache",
 ]
