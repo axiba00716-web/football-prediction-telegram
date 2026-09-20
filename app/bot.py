@@ -14,14 +14,17 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from app.config import get_settings
-from app.data import FootballAPIError, sync_date, sync_team_history
+from app.config import get_settings, get_timezone
+from app.data import (
+    FootballAPIError, from_utc_naive, local_day_window,
+    sync_local_date, sync_team_history,
+)
 from app.db import Fixture, Prediction, get_session, init_db
 from app.predictor import (
     MODEL_VERSION, PredictionResult, format_prediction, predict_match,
@@ -40,33 +43,13 @@ FINISHED_STATUSES = ["FT", "AET", "PEN", "finished", "Match Finished"]
 # 时区工具
 # --------------------------------------------------------------------------- #
 
-_FALLBACK_OFFSETS = {
-    "Asia/Shanghai": 8,
-    "Asia/Hong_Kong": 8,
-    "Asia/Taipei": 8,
-    "Asia/Singapore": 8,
-    "Asia/Tokyo": 9,
-    "UTC": 0,
-}
-
-
-def _tzinfo():
-    """按 TIMEZONE 取 tzinfo；tzdata 缺失时回退固定偏移，绝不抛异常。"""
-    name = (get_settings().TIMEZONE or "UTC").strip()
-    try:
-        from zoneinfo import ZoneInfo
-        return ZoneInfo(name)
-    except Exception:
-        offset = _FALLBACK_OFFSETS.get(name)
-        if offset is None:
-            logger.warning("时区 %s 不可用，回退 UTC", name)
-            return timezone.utc
-        return timezone(timedelta(hours=offset))
-
-
 def today_local() -> date:
-    """按配置时区（默认 Asia/Shanghai）取「今天」。"""
-    return datetime.now(_tzinfo()).date()
+    """按 ``TIMEZONE``（默认 Asia/Shanghai）取用户口中的「今天」。
+
+    这是「比赛当天」的唯一口径：用户说今天，指的是北京时间今天，
+    而不是容器本机（Railway 为 UTC）的今天。
+    """
+    return datetime.now(get_timezone()).date()
 
 
 # --------------------------------------------------------------------------- #
@@ -92,26 +75,26 @@ async def _reply(update: Update, text: str) -> None:
         await update.message.reply_text(p)
 
 
+def _local_time_text(start_time) -> str:
+    """库里存的是 UTC naive，展示前换算到 ``TIMEZONE``。"""
+    local = from_utc_naive(start_time)
+    if local is None:
+        return "时间待定"
+    return local.strftime("%Y-%m-%d %H:%M")
+
+
 def _fmt_fixture(f) -> str:
-    when = f.start_time.strftime("%m-%d %H:%M") if getattr(f, "start_time", None) else "时间待定"
-    return f"[{f.league}] {f.home} vs {f.away} @ {when}"
-
-
-def _day_start(d: date) -> datetime:
-    return datetime(d.year, d.month, d.day)
-
-
-def _day_end(d: date) -> datetime:
-    return _day_start(d) + timedelta(days=1)
+    return f"[{f.league}] {f.home} vs {f.away} @ {_local_time_text(getattr(f, 'start_time', None))}"
 
 
 def _fixtures_on(target: date) -> list[Fixture]:
-    """查询数据库中某一天的比赛（左闭右开窗口），Session 显式关闭。"""
+    """查询用户时区某一天的比赛（内部换算为 UTC 窗口），Session 显式关闭。"""
+    utc_start, utc_end = local_day_window(target)
     session = get_session()
     try:
         return session.query(Fixture).filter(
-            Fixture.start_time >= _day_start(target),
-            Fixture.start_time < _day_end(target),
+            Fixture.start_time >= utc_start,
+            Fixture.start_time < utc_end,
         ).order_by(Fixture.start_time).all()
     finally:
         session.close()
@@ -153,7 +136,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def _sync_and_show(update: Update, target: date) -> None:
     try:
-        await sync_date(target)
+        await sync_local_date(target)
     except FootballAPIError as e:
         await _reply(update, f"⚠️ 数据同步失败：{e}")
         return
@@ -167,7 +150,8 @@ async def _sync_and_show(update: Update, target: date) -> None:
         await _reply(update, f"{target.isoformat()} 暂无配置联赛的比赛。")
         return
 
-    lines = [f"📅 {target.isoformat()} 比赛（{len(rows)} 场，时间为 UTC）："]
+    tzname = get_settings().TIMEZONE
+    lines = [f"📅 {target.isoformat()} 比赛（{len(rows)} 场，时间为 {tzname}）："]
     lines.extend(_fmt_fixture(f) for f in rows)
     await _reply(update, "\n".join(lines))
 
@@ -253,7 +237,7 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # 当日无比赛 → 先同步一次
     if not fixtures:
         try:
-            await sync_date(target)
+            await sync_local_date(target)
         except FootballAPIError as e:
             await _reply(update, f"⚠️ 同步赛程失败：{e}")
             return
@@ -337,7 +321,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"预测(Prediction)数量: {n_predictions}\n"
         f"配置联赛: {settings.ENABLED_LEAGUES}\n"
         f"最少历史场次: {settings.MIN_HISTORY_MATCHES}\n"
-        f"时区: {settings.TIMEZONE}\n"
+        f"时区: {settings.TIMEZONE}（赛程与开赛时间均按此时区）\n"
         f"今天(按时区): {today_local().isoformat()}"
     ))
 

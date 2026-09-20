@@ -89,11 +89,11 @@ def test_predict_uses_real_team_ids(monkeypatch):
         seen_ids.append(team_id)
         return 0
 
-    async def fake_sync_date(target):
+    async def fake_sync_local_date(target, tz=None):
         return 0, []
 
     monkeypatch.setattr(bot_mod, "sync_team_history", fake_sync_history)
-    monkeypatch.setattr(bot_mod, "sync_date", fake_sync_date)
+    monkeypatch.setattr(bot_mod, "sync_local_date", fake_sync_local_date)
 
     update = _Update()
     asyncio.run(bot_mod.predict(update, None))

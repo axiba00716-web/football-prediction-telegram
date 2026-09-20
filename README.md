@@ -131,10 +131,25 @@ TIMEZONE=Asia/Shanghai
 
 ## 时间口径说明
 
-- `/today` 的「今天」按 `TIMEZONE`（默认 `Asia/Shanghai`）计算；
-- 数据库保存的时间为 **UTC**，与 API-Football `date=` 参数同一口径，
-  当天筛选窗口为 `[00:00, 次日 00:00)`，覆盖当天深夜开赛的比赛；
-- 命令输出中的开赛时间为 UTC，阅读时请自行 +8（东八区）。
+「今天 / 明天」一律按**比赛时间所在时区** `TIMEZONE`（默认 `Asia/Shanghai`）计算，
+不依赖服务器本机时间（Railway 容器为 UTC）。全项目只有一条时间规则：
+
+1. **API 请求带 `timezone`**：`/fixtures?date=YYYY-MM-DD&timezone=<TIMEZONE>`，
+   让 API-Football 按该时区切分「这一天」，一次请求即可覆盖凌晨场；
+2. **解析保留偏移**：API 时间先解析为 aware datetime（`+00:00` / `+08:00` / `Z`）；
+3. **入库统一 UTC naive**：aware 折算到 UTC 后去掉 `tzinfo` 再存库，
+   naive 一律视为已经是 UTC —— 库里只有一种表示，**绝不 naive/aware 混用**；
+4. **筛选按本地日折算**：把本地那一天的 `[00:00, 次日 00:00)` 换算成 UTC
+   窗口再比较，例如东八区 9/20 → UTC `[9/19 16:00, 9/20 16:00)`；
+5. **展示转回本地时区**：`start_time.astimezone(TZ).strftime("%Y-%m-%d %H:%M")`。
+
+因此北京时间 `00:00–08:00` 使用 `/today` 也不会拿到前一天或后一天的赛程：
+
+```text
+TIMEZONE=Asia/Shanghai，容器本机 UTC
+/today → API: date=2026-09-20&timezone=Asia/Shanghai
+         显示为 2026-09-20 00:30 / 2026-09-20 18:00（库里存 UTC 16:30 / 10:00）
+```
 
 ## Telegram 测试命令
 

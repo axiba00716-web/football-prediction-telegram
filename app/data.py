@@ -14,12 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
 
-from app.config import get_settings
+from app.config import get_settings, get_timezone
 from app.db import Fixture, get_session, init_db
 
 logger = logging.getLogger(__name__)
@@ -74,6 +74,37 @@ def _parse_time(value) -> Optional[datetime]:
             except ValueError:
                 continue
     return None
+
+
+def to_utc_naive(value) -> Optional[datetime]:
+    """统一时间存储口径：一律转成 **UTC naive datetime**。
+
+    规则（全项目唯一约定）
+    --------------------
+    * API 时间先解析为 aware datetime（保留 UTC 偏移信息）；
+    * aware → 换算到 UTC → 去掉 tzinfo（naive）后入库；
+    * 本来就是 naive 的 → 视为已经是 UTC，原样保留。
+
+    这样数据库里只有一种表示，筛选时用 naive UTC 边界比较，
+    **绝不会出现 naive 与 aware 混用导致的比较错位**。
+    """
+    dt = _parse_time(value)
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def from_utc_naive(value, tz=None):
+    """把库里的 UTC naive 时间还原为 ``TIMEZONE`` 下的 aware datetime（展示用）。"""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    if tz is None:
+        tz = get_timezone()
+    return value.astimezone(tz)
 
 
 def _is_finished_status(status) -> bool:
@@ -145,7 +176,17 @@ class FootballAPI:
 
     def _request(self, path: str, params: Optional[dict] = None) -> dict:
         """同步 GET。测试可直接 patch 本方法，无需真实网络。"""
-        return _http_get(path, params, self.api_key, self.base_url, self.timeout)
+        return _http_get(path, self._with_timezone(params), self.api_key, self.base_url, self.timeout)
+
+    def _with_timezone(self, params: Optional[dict]) -> dict:
+        """为每个请求补上 ``timezone=<TIMEZONE>``。
+
+        API-Football 的 ``timezone`` 参数决定 ``date=`` 按哪个时区的「一天」来切，
+        默认是 UTC。不传的话东八区的凌晨场次会被算到前一天去。
+        """
+        merged = dict(params or {})
+        merged.setdefault("timezone", self.timezone)
+        return merged
 
     async def request(self, path: str, params: Optional[dict] = None) -> dict:
         """异步 GET：在线程中执行同步请求，避免阻塞 Telegram 事件循环。"""
@@ -154,9 +195,14 @@ class FootballAPI:
     # -- 业务接口 --------------------------------------------------------- #
 
     async def fixtures_by_date(self, target: date) -> list[dict]:
-        """``GET /fixtures?date=YYYY-MM-DD``，只保留 ENABLED_LEAGUES。"""
+        """``GET /fixtures?date=YYYY-MM-DD&timezone=<TIMEZONE>``。
+
+        ``target`` 是 ``TIMEZONE`` 下的日期；``timezone`` 参数保证 API 按同一
+        时区切分「这一天」，东八区凌晨场次不会被算到前一天。
+        只保留 ENABLED_LEAGUES。
+        """
         allowed = set(get_settings().enabled_league_ids)
-        data = await self.request("/fixtures", {"date": target.isoformat()})
+        data = await self.request("/fixtures", {"date": target.strftime("%Y-%m-%d")})
         return self._rows(data, allowed or None)
 
     async def team_fixtures(self, team_id: int, last: int = 20,
@@ -224,7 +270,7 @@ def _parse_fixture(item: dict, allowed_leagues: Optional[set[int]] = None) -> Op
         "external_id": _int(fix.get("id")),
         "league": str(league.get("name") or ""),
         "league_id": league_id,
-        "start_time": _parse_time(fix.get("date")),
+        "start_time": to_utc_naive(fix.get("date")),
         "home_team_id": _int(home_team.get("id")),
         "away_team_id": _int(away_team.get("id")),
         "home": str(home_team.get("name") or ""),
@@ -292,13 +338,65 @@ def upsert_fixtures(rows: list[dict]) -> int:
 
 
 def _day_window(target: date) -> tuple[datetime, datetime]:
-    """当天时间窗口（左闭右开）。
+    """UTC 口径的当天时间窗口（左闭右开，naive）。
 
-    数据库存的是 UTC 时间，与 API-Football ``date=`` 参数同一口径：
-    ``[target 00:00, target+1 00:00)``，确保覆盖当天 23:xx 开赛的比赛。
+    **仅用于 ``sync_date``**（UTC 日期口径）。业务命令请使用
+    :func:`local_day_window`，它按 ``TIMEZONE`` 折算边界。
+    ``[target 00:00, target+1 00:00)`` 确保覆盖当天 23:xx 开赛的比赛。
     """
     day_start = datetime(target.year, target.month, target.day)
     return day_start, day_start + timedelta(days=1)
+
+
+def local_day_window(target: date, tz=None) -> tuple[datetime, datetime]:
+    """把「用户时区某一天」换算成 UTC 时间窗口（左闭右开，naive）。
+
+    这是 ``/today``、``/tomorrow``、``/predict`` 的正确口径：用户口中的
+    "今天" 是 ``TIMEZONE``（默认 Asia/Shanghai）的那一天，而库里存的是 UTC，
+    因此必须先把本地日期的 ``[00:00, 次日 00:00)`` 折算到 UTC 再比较。
+
+    例：东八区 9/20 → UTC 窗口 ``[9/19 16:00, 9/20 16:00)``，
+    这样北京时间 00:00–08:00 也不会漏掉凌晨场、也不会拿到前一天。
+    """
+    if tz is None:
+        tz = get_timezone()
+    local_start = datetime(target.year, target.month, target.day, tzinfo=tz)
+    local_end = local_start + timedelta(days=1)
+    utc_start = local_start.astimezone(timezone.utc).replace(tzinfo=None)
+    utc_end = local_end.astimezone(timezone.utc).replace(tzinfo=None)
+    return utc_start, utc_end
+
+
+async def sync_local_date(target: date, tz=None) -> tuple[int, list[dict]]:
+    """按**用户时区**同步某一天的全部比赛。返回 ``(写入条数, 比赛行列表)``。
+
+    与 ``sync_date`` 的区别：``sync_date`` 的 ``target`` 是 UTC 日期；
+    本函数的 ``target`` 是 ``TIMEZONE`` 下的日期——这才是 ``/today``、
+    ``/tomorrow``、``/predict`` 的正确口径。
+
+    * 请求带 ``timezone=<TIMEZONE>``，API 直接按该时区切分「这一天」，
+      一次请求即可覆盖东八区的凌晨场（无需像 UTC 口径那样查两天）；
+    * 入库时间统一为 **UTC naive**（见 :func:`to_utc_naive`）；
+    * 筛选边界用 ``local_day_window()`` 折算出的 UTC naive 窗口。
+    """
+    utc_start, utc_end = local_day_window(target, tz)
+
+    rows = await fixtures_by_date(target)
+    written = upsert_fixtures(rows)
+
+    session = get_session()
+    try:
+        fixtures = session.query(Fixture).filter(
+            Fixture.start_time >= utc_start,
+            Fixture.start_time < utc_end,
+        ).order_by(Fixture.start_time).all()
+        result = [
+            {c.name: getattr(f, c.name) for c in f.__table__.columns}
+            for f in fixtures
+        ]
+    finally:
+        session.close()
+    return written, result
 
 
 async def sync_date(target: date) -> tuple[int, list[dict]]:
@@ -348,6 +446,7 @@ sync_team_fixtures = sync_team_history
 __all__ = [
     "FootballAPIError", "FootballAPI",
     "_parse_time", "_parse_fixture", "_is_finished_status", "_day_window",
+    "to_utc_naive", "from_utc_naive",
     "fixtures_by_date", "team_fixtures", "upsert_fixtures",
-    "sync_date", "sync_team_history", "sync_team_fixtures",
+    "sync_date", "sync_local_date", "sync_team_history", "sync_team_fixtures",
 ]

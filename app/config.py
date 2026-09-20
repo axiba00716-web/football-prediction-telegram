@@ -68,3 +68,47 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """返回缓存的 Settings 单例（环境变量变更需重启进程）。"""
     return Settings()
+
+
+# 常见时区的固定偏移回退表：容器缺少 tzdata 时仍能按用户时区算日期
+_FALLBACK_OFFSETS = {
+    "Asia/Shanghai": 8,
+    "Asia/Chongqing": 8,
+    "Asia/Hong_Kong": 8,
+    "Asia/Macau": 8,
+    "Asia/Taipei": 8,
+    "Asia/Singapore": 8,
+    "Asia/Kuala_Lumpur": 8,
+    "Asia/Manila": 8,
+    "Asia/Tokyo": 9,
+    "Asia/Seoul": 9,
+    "Asia/Bangkok": 7,
+    "Asia/Jakarta": 7,
+    "Asia/Kolkata": 5.5,
+    "Asia/Dubai": 4,
+    "Europe/London": 0,
+    "Europe/Berlin": 1,
+    "Europe/Madrid": 1,
+    "Europe/Paris": 1,
+    "UTC": 0,
+}
+
+
+def get_timezone():
+    """按 ``TIMEZONE`` 返回 tzinfo。
+
+    优先 ``zoneinfo``（需要系统 tzdata）；缺失时按内置偏移表回退，
+    再不行退到 UTC。**绝不抛异常**，否则机器人会启动失败。
+    """
+    from datetime import timedelta, timezone
+
+    name = (get_settings().TIMEZONE or "UTC").strip()
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except Exception:
+        pass
+    offset = _FALLBACK_OFFSETS.get(name)
+    if offset is None:
+        return timezone.utc
+    return timezone(timedelta(hours=offset))
