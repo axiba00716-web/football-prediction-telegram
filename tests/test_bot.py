@@ -37,11 +37,15 @@ def _prep(monkeypatch, tmp_path):
 
 
 def _seed_today_fixture(session, fixture_pk=1, home_id=101, away_id=202):
+    """在「今天」种一场比赛——必须用动态日期，否则跨天运行测试会失败。"""
     from app.db import Fixture
+    import app.bot as _b
+    _day = _b.today_local()
     f = Fixture(
         external_id=9000 + fixture_pk,
         league="EPL", league_id=39,
-        start_time=datetime(2026, 9, 20, 15, 0, 0),
+        # 用当天 12:00，避开本地日窗口边界（东八区 00:00 / 次日 00:00）
+        start_time=datetime(_day.year, _day.month, _day.day, 12, 0, 0),
         home_team_id=home_id, away_team_id=away_id,
         home="Arsenal", away="Chelsea", status="NS",
     )

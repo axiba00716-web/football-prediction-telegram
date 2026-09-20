@@ -45,6 +45,14 @@ def _isolate_env(monkeypatch, tmp_path):
     sys.modules["telegram"] = tg
     sys.modules["telegram.ext"] = te
 
+    # 重置模块级全局状态（赛季缓存 / 历史缓存），避免测试间互相污染
+    try:
+        import app.data as _data_module
+        _data_module.set_working_season(None)
+        _data_module.clear_history_cache()
+    except Exception:  # noqa: BLE001
+        pass
+
     import app.db as db_module
     db_module.reset_db_state()
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'test.db'}")

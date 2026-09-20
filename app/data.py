@@ -241,9 +241,19 @@ class FootballAPI:
                 data = await self.request(
                     "/fixtures", {"team": int(team_id), "season": int(candidate)}
                 )
-            except FootballAPIError:
+            except FootballAPIError as e:
                 tried += 1
-                continue  # 该赛季不可访问（如免费套餐的 2026）→ 试上一个赛季
+                # 免费套餐会明确提示可用赛季范围 → 直接跳到那几年，别浪费配额
+                hinted = _parse_season_hint(str(e))
+                if hinted:
+                    logger.info("API 提示可用赛季 %s，直接切换", hinted)
+                    return await self._fetch_season(team_id, hinted[0], last, allowed_leagues)
+                logger.debug("赛季 %s 不可访问，回退上一个赛季", candidate)
+                continue
+            except Exception as e:  # noqa: BLE001 - 单个赛季失败不应中断整体同步
+                tried += 1
+                logger.warning("赛季 %s 请求异常: %s", candidate, e)
+                continue
             rows = self._rows(data, allowed_leagues)
             finished = [r for r in rows if _is_finished_status(r.get("status"))]
             if not finished:
@@ -254,6 +264,26 @@ class FootballAPI:
             return finished[: max(1, int(last))]
 
         return []  # 所有可访问赛季都没有已结束比赛
+
+    async def _fetch_season(self, team_id: int, season: int, last: int,
+                            allowed_leagues: Optional[set[int]]) -> list[dict]:
+        """抓取指定赛季某队的已结束比赛（内部方法，会写入全局可用赛季缓存）。"""
+        global _WORKING_SEASON
+        for sid in (season, season - 1, season - 2):
+            try:
+                data = await self.request(
+                    "/fixtures", {"team": int(team_id), "season": int(sid)}
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            rows = self._rows(data, allowed_leagues)
+            finished = [r for r in rows if _is_finished_status(r.get("status"))]
+            if not finished:
+                continue
+            _WORKING_SEASON = int(sid)
+            finished.sort(key=lambda r: r.get("start_time") or datetime.min, reverse=True)
+            return finished[: max(1, int(last))]
+        return []
 
     # -- 工具 ------------------------------------------------------------- #
 
@@ -286,6 +316,22 @@ def set_working_season(season: Optional[int]) -> None:
 def get_working_season() -> Optional[int]:
     """返回已验证可用的赛季；尚未探测则为 None。"""
     return _WORKING_SEASON
+
+
+def _parse_season_hint(message: str) -> list[int]:
+    """从 API 报错里提取可用赛季，如 ``try from 2022 to 2024`` → ``[2024, 2023, 2022]``。
+
+    免费套餐的报错会明确给出可用范围，直接照它说的做，
+    比逐年盲试省下大量配额（100 次/天非常紧张）。
+    """
+    import re
+    m = re.search(r"(\d{4})\s*(?:to|-|~|–)\s*(\d{4})", str(message))
+    if not m:
+        return []
+    lo, hi = int(m.group(1)), int(m.group(2))
+    if not (1900 < lo <= hi < 2100):
+        return []
+    return sorted(range(lo, hi + 1), reverse=True)
 
 
 def _season_candidates(season: Optional[int] = None) -> list[int]:

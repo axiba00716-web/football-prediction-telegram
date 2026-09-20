@@ -240,7 +240,8 @@ def test_team_fixtures_falls_back_to_available_season(monkeypatch):
     monkeypatch.setattr(data_mod, "_http_get", fake)
     rows = asyncio.run(team_fixtures(33, last=20))
 
-    assert tried == [2026, 2025, 2024], f"应依次尝试并停在可用赛季，实际 {tried}"
+    # 报错含 "2022-2024" 提示 → 直接跳到 2024，不再盲试 2025
+    assert tried == [2026, 2024], f"命中提示后应直接跳到 2024，实际 {tried}"
     assert len(rows) == 1
 
 
@@ -291,3 +292,47 @@ def test_team_fixtures_returns_empty_when_no_season_available(monkeypatch):
             FootballAPIError("全部赛季无权限")),
     )
     assert asyncio.run(team_fixtures(33, last=20)) == []
+
+
+def test_parse_season_hint_from_api_error():
+    """免费套餐报错里给出可用赛季范围，应被正确解析。"""
+    from app.data import _parse_season_hint
+
+    msg = ("API-Football 返回错误: {'plan': 'Free plans do not have access "
+           "to this season, try from 2022 to 2024.'}")
+    assert _parse_season_hint(msg) == [2024, 2023, 2022]
+    assert _parse_season_hint("没有年份提示") == []
+    assert _parse_season_hint("") == []
+
+
+def test_season_hint_skips_blind_probing(monkeypatch):
+    """命中 API 提示后应直接跳到可用赛季，而不是逐年盲试（省配额）。"""
+    import asyncio
+
+    import app.data as data_mod
+    from app.data import FootballAPIError, set_working_season, team_fixtures
+
+    set_working_season(None)
+    tried = []
+
+    def fake(path, params, api_key, base_url, timeout=None):
+        season = params.get("season")
+        tried.append(season)
+        if season == 2026:
+            raise FootballAPIError("try from 2022 to 2024")
+        if season == 2024:
+            return {"response": [
+                {"fixture": {"id": 1, "date": "2024-05-01T15:00:00+00:00",
+                             "status": {"short": "FT"}},
+                 "league": {"id": 39, "name": "EPL"},
+                 "teams": {"home": {"id": 33, "name": "A"},
+                           "away": {"id": 34, "name": "B"}},
+                 "goals": {"home": 2, "away": 1}},
+            ]}
+        return {"response": []}
+
+    monkeypatch.setattr(data_mod, "_http_get", fake)
+    rows = asyncio.run(team_fixtures(33, last=20))
+
+    assert tried == [2026, 2024], f"应直接跳到 2024，实际尝试了 {tried}"
+    assert len(rows) == 1
