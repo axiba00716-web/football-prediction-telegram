@@ -44,6 +44,14 @@ def main() -> None:
     init_db()
     logger.info("Database initialized.")
 
+    # 启动探测一次免费套餐能力（赔率/积分榜是否可用），结果直接打进日志。
+    # 仅 5 次请求且同次部署不重复；失败绝不阻断启动。
+    try:
+        from app.probe import probe_once_on_start
+        probe_once_on_start()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("启动探测跳过: %s", e)
+
     if not settings.FOOTBALL_API_KEY:
         logger.warning(
             "FOOTBALL_API_KEY 未配置，/today、/tomorrow、/predict 可能无法同步数据。"
