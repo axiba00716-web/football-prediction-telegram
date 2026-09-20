@@ -34,9 +34,16 @@ football-prediction-telegram/
 │   ├── predictor.py     # Poisson 模型
 │   ├── bot.py           # Telegram 命令处理器
 │   └── main.py          # 启动入口（polling）
+├── scripts/
+│   ├── pre-commit-check.sh  # compileall + pytest + git diff --check
+│   └── verify_all.py        # 无 pytest 环境下的等价校验
 └── tests/
     ├── conftest.py
-    └── test_predictor.py
+    ├── test_predictor.py    # Poisson 模型（纯函数）
+    ├── test_db.py           # URL 归一化 / 字段 / 建表
+    ├── test_data_parsing.py # 时间解析 / 球队 ID / sync
+    ├── test_main.py         # 同步入口 / polling
+    └── test_bot.py          # /predict 使用真实球队 ID
 ```
 
 ## 快速开始（本地）
@@ -105,9 +112,14 @@ TIMEZONE=Asia/Shanghai
 7. 回到机器人服务，点 **Deploy / Redeploy**，查看 **Deployments → Logs**
 8. 正常启动日志：
    ```
-   Initializing database...
-   Starting Telegram bot (polling)...
+   Database initialized.
+   Starting Telegram bot in polling mode
    ```
+
+> **首次部署请使用全新数据库。** 本项目处于 MVP 阶段，数据表结构调整频繁；
+> 若复用早期 SQLite/PostgreSQL 旧库，`init_db()` 会做一次 best-effort 补列
+> （`ALTER TABLE ADD COLUMN`）以避免缺字段导致启动失败，但不保证历史数据口径一致。
+> 旧库建议直接删除重建，或改用 Railway 新建的 PostgreSQL 实例。
 
 ### 常见日志排查
 
@@ -116,6 +128,13 @@ TIMEZONE=Asia/Shanghai
 | `TELEGRAM_BOT_TOKEN 未配置` | Token 未注入机器人服务 Variables |
 | `FOOTBALL_API_KEY 未配置` | API Key 未注入（不影响 /start、/status，但 /predict 无数据） |
 | 数据库连接错误 | `DATABASE_URL` 未复制到机器人服务（仅存在于 PostgreSQL 服务不算注入） |
+
+## 时间口径说明
+
+- `/today` 的「今天」按 `TIMEZONE`（默认 `Asia/Shanghai`）计算；
+- 数据库保存的时间为 **UTC**，与 API-Football `date=` 参数同一口径，
+  当天筛选窗口为 `[00:00, 次日 00:00)`，覆盖当天深夜开赛的比赛；
+- 命令输出中的开赛时间为 UTC，阅读时请自行 +8（东八区）。
 
 ## Telegram 测试命令
 

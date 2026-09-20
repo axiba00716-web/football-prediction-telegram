@@ -2,19 +2,19 @@
 
 职责
 ----
-* 封装 ``/fixtures?date=...``（按日期）与 ``/fixtures?team=...&last=...``（按球队历史）。
-* 请求头 ``x-apisports-key``，超时 20s。
-* 统一解析为内部 dict schema（含真实球队 ID），仅保留 ``ENABLED_LEAGUES`` 联赛。
-* ``upsert_fixtures``：按 ``external_id`` 去重写入。
+* 封装 ``/fixtures?date=YYYY-MM-DD``（按日期）与 ``/fixtures?team=<id>&last=<n>``（球队历史）。
+* 请求头 ``x-apisports-key``，所有请求带 timeout。
+* 统一解析为内部 dict schema（含**真实球队 ID**），按 ``external_id`` 去重写入。
 * ``sync_date`` / ``sync_team_history``：供 bot 命令调用的异步入口。
 
-错误一律抛 ``FootballAPIError``，绝不让机器人静默崩溃。
+错误一律抛 ``FootballAPIError``，绝不让 Telegram 命令无响应。
 """
 
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime
+import logging
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 import httpx
@@ -22,12 +22,17 @@ import httpx
 from app.config import get_settings
 from app.db import Fixture, get_session, init_db
 
-# 有效「已结束」状态（不区分大小写）
+logger = logging.getLogger(__name__)
+
+DEFAULT_TIMEOUT = 20.0
+DEFAULT_BASE_URL = "https://v3.football.api-sports.io"
+
+# 有效「已结束」状态（不区分大小写）——与 predictor 保持一致
 _FINISHED_STATUSES = {"FT", "AET", "PEN", "FINISHED", "MATCH FINISHED"}
 
 
 class FootballAPIError(Exception):
-    """API-Football 调用失败（Key 缺失 / 网络 / HTTP / API errors）。"""
+    """API-Football 调用失败（Key 缺失 / 网络 / HTTP / JSON / API errors）。"""
 
 
 # --------------------------------------------------------------------------- #
@@ -35,11 +40,16 @@ class FootballAPIError(Exception):
 # --------------------------------------------------------------------------- #
 
 def _parse_time(value) -> Optional[datetime]:
-    """API 日期可能是 ISO 字符串或 datetime；统一归一化为 datetime。
+    """把 API 日期统一归一化为 datetime。
 
-    API-Football 常见格式：``2026-09-20T15:00:00+00:00`` / ``...Z``，
-    优先用 ``datetime.fromisoformat`` 解析（Python 3.11+ 原生支持 ``Z`` 与偏移量），
-    失败时回退到显式 strptime 格式。解析失败返回 ``None``，由调用方决定是否丢弃该条比赛。
+    兼容 API-Football 常见格式::
+
+        2026-09-20T15:00:00Z
+        2026-09-20T15:00:00+00:00
+        2026-09-20 15:00:00
+
+    优先 ``datetime.fromisoformat(value.replace("Z", "+00:00"))``，
+    失败再回退显式 strptime。解析失败返回 ``None``。
     """
     if value is None:
         return None
@@ -49,7 +59,9 @@ def _parse_time(value) -> Optional[datetime]:
         return datetime(value.year, value.month, value.day)
     if isinstance(value, str):
         s = value.strip()
-        # 优先：fromisoformat（原生处理 +00:00 / Z 偏移，无需去除时区信息）
+        if not s:
+            return None
+        # 优先：fromisoformat（原生处理 +00:00 / Z 偏移）
         try:
             return datetime.fromisoformat(s.replace("Z", "+00:00"))
         except ValueError:
@@ -72,33 +84,29 @@ def _is_finished_status(status) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# 底层 HTTP
+# 底层 HTTP（可被测试 patch）
 # --------------------------------------------------------------------------- #
 
-def _headers() -> dict[str, str]:
-    key = get_settings().FOOTBALL_API_KEY
-    if not key:
+def _http_get(path: str, params: Optional[dict], api_key: str, base_url: str,
+              timeout: float = DEFAULT_TIMEOUT) -> dict:
+    """真正发起 GET 的地方。所有异常统一转 FootballAPIError。"""
+    if not api_key:
         raise FootballAPIError("FOOTBALL_API_KEY 未配置，无法调用 API-Football。")
-    return {"x-apisports-key": key, "Accept": "application/json"}
 
-
-def _base_url() -> str:
-    return (get_settings().FOOTBALL_API_BASE_URL or "https://v3.football.api-sports.io").rstrip("/")
-
-
-def _request(path: str, params: Optional[dict] = None) -> dict:
-    """同步 GET 请求。超时 20s，错误统一转 FootballAPIError。"""
-    url = f"{_base_url()}{path}"
+    url = f"{base_url.rstrip('/')}{path}"
+    headers = {"x-apisports-key": api_key, "Accept": "application/json"}
     try:
-        with httpx.Client(timeout=20.0) as client:
-            resp = client.get(url, headers=_headers(), params=params or {})
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.get(url, headers=headers, params=params or {})
     except httpx.TimeoutException as e:
         raise FootballAPIError(f"API-Football 请求超时: {e}") from e
     except httpx.HTTPError as e:
         raise FootballAPIError(f"API-Football 网络错误: {e}") from e
 
-    if resp.status_code == 401 or resp.status_code == 403:
-        raise FootballAPIError(f"API-Football 认证失败 (HTTP {resp.status_code})，请检查 FOOTBALL_API_KEY。")
+    if resp.status_code in (401, 403):
+        raise FootballAPIError(
+            f"API-Football 认证失败 (HTTP {resp.status_code})，请检查 FOOTBALL_API_KEY。"
+        )
     if resp.status_code >= 400:
         raise FootballAPIError(f"API-Football HTTP {resp.status_code}: {resp.text[:300]}")
 
@@ -112,21 +120,79 @@ def _request(path: str, params: Optional[dict] = None) -> dict:
     return data
 
 
-def _request_async(path: str, params: Optional[dict] = None) -> dict:
-    """异步包装：在默认事件循环中运行同步 httpx（避免引入额外异步依赖）。"""
-    return asyncio.to_thread(_request, path, params)
-
-
 # --------------------------------------------------------------------------- #
-# 对外接口
+# FootballAPI
 # --------------------------------------------------------------------------- #
+
+class FootballAPI:
+    """API-Football 客户端。配置全部来自 ``get_settings()``。"""
+
+    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None,
+                 timezone: Optional[str] = None, timeout: float = DEFAULT_TIMEOUT) -> None:
+        settings = get_settings()
+        self.api_key = api_key if api_key is not None else settings.FOOTBALL_API_KEY
+        self.base_url = (base_url or settings.FOOTBALL_API_BASE_URL or DEFAULT_BASE_URL).rstrip("/")
+        self.timezone = timezone or settings.TIMEZONE or "UTC"
+        self.timeout = timeout
+
+    # -- HTTP ------------------------------------------------------------- #
+
+    def _headers(self) -> dict:
+        """请求头（Key 缺失时抛 FootballAPIError）。"""
+        if not self.api_key:
+            raise FootballAPIError("FOOTBALL_API_KEY 未配置，无法调用 API-Football。")
+        return {"x-apisports-key": self.api_key, "Accept": "application/json"}
+
+    def _request(self, path: str, params: Optional[dict] = None) -> dict:
+        """同步 GET。测试可直接 patch 本方法，无需真实网络。"""
+        return _http_get(path, params, self.api_key, self.base_url, self.timeout)
+
+    async def request(self, path: str, params: Optional[dict] = None) -> dict:
+        """异步 GET：在线程中执行同步请求，避免阻塞 Telegram 事件循环。"""
+        return await asyncio.to_thread(self._request, path, params)
+
+    # -- 业务接口 --------------------------------------------------------- #
+
+    async def fixtures_by_date(self, target: date) -> list[dict]:
+        """``GET /fixtures?date=YYYY-MM-DD``，只保留 ENABLED_LEAGUES。"""
+        allowed = set(get_settings().enabled_league_ids)
+        data = await self.request("/fixtures", {"date": target.isoformat()})
+        return self._rows(data, allowed or None)
+
+    async def team_fixtures(self, team_id: int, last: int = 20,
+                            allowed_leagues: Optional[set[int]] = None) -> list[dict]:
+        """``GET /fixtures?team=<id>&last=<n>``。
+
+        默认**不按联赛过滤**：球队历史可能来自杯赛/其他联赛，必须能被预测器使用。
+        """
+        if not team_id:
+            return []
+        data = await self.request("/fixtures", {"team": int(team_id), "last": int(last)})
+        return self._rows(data, allowed_leagues)
+
+    # -- 工具 ------------------------------------------------------------- #
+
+    @staticmethod
+    def _rows(data: dict, allowed: Optional[set[int]]) -> list[dict]:
+        raw = (data.get("response") or []) if isinstance(data, dict) else []
+        out: list[dict] = []
+        for item in raw:
+            parsed = _parse_fixture(item, allowed)
+            if parsed and parsed["external_id"]:
+                out.append(parsed)
+        return out
+
 
 def _parse_fixture(item: dict, allowed_leagues: Optional[set[int]] = None) -> Optional[dict]:
-    """将一个 API fixture 对象解析为内部统一 dict。
+    """把一个 API fixture 对象解析为内部统一 dict。
 
     schema::
+
         external_id, league, league_id, start_time, home_team_id, away_team_id,
         home, away, status, home_score, away_score
+
+    ``home_team_id`` / ``away_team_id`` 取自 ``item["teams"]["home"]["id"]`` /
+    ``item["teams"]["away"]["id"]``，即 **API-Football 真实球队 ID**。
     """
     if not isinstance(item, dict):
         return None
@@ -136,7 +202,7 @@ def _parse_fixture(item: dict, allowed_leagues: Optional[set[int]] = None) -> Op
     league = item.get("league") or {}
 
     league_id = int(league.get("id") or 0)
-    if allowed_leagues and league_id not in allowed_leagues:
+    if allowed_leagues is not None and league_id not in allowed_leagues:
         return None
 
     home_team = teams.get("home") or {}
@@ -148,6 +214,12 @@ def _parse_fixture(item: dict, allowed_leagues: Optional[set[int]] = None) -> Op
         except (TypeError, ValueError):
             return 0
 
+    def _score(v) -> Optional[int]:
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
     return {
         "external_id": _int(fix.get("id")),
         "league": str(league.get("name") or ""),
@@ -158,51 +230,45 @@ def _parse_fixture(item: dict, allowed_leagues: Optional[set[int]] = None) -> Op
         "home": str(home_team.get("name") or ""),
         "away": str(away_team.get("name") or ""),
         "status": str((fix.get("status") or {}).get("short") or ""),
-        "home_score": goals.get("home"),
-        "away_score": goals.get("away"),
+        "home_score": _score(goals.get("home")),
+        "away_score": _score(goals.get("away")),
     }
 
 
-def fixtures_by_date(target: date) -> list[dict]:
-    """按日期获取比赛（已过滤 ENABLED_LEAGUES）。返回内部 dict 列表。"""
-    settings = get_settings()
-    allowed = set(settings.enabled_league_ids)
-    data = _request("/fixtures", params={"date": target.isoformat()})
-    raw = (data.get("response") or []) if isinstance(data, dict) else []
-    out: list[dict] = []
-    for item in raw:
-        parsed = _parse_fixture(item, allowed or None)
-        if parsed and parsed["external_id"]:
-            out.append(parsed)
-    return out
+def _request(path: str, params: Optional[dict] = None) -> dict:
+    """模块级同步请求入口（向后兼容，内部走 FootballAPI）。"""
+    return FootballAPI()._request(path, params)
 
 
-def team_fixtures(team_id: int, last: int = 20) -> list[dict]:
-    """按球队 ID 获取最近 ``last`` 场比赛（含历史，已结束 + 未结束混合）。
+async def _request_async(path: str, params: Optional[dict] = None) -> dict:
+    """模块级异步请求入口。"""
+    return await FootballAPI().request(path, params)
 
-    调用方（predictor）自行按 status 过滤未结束比赛。
-    """
-    if not team_id:
-        return []
-    data = _request("/fixtures", params={"team": int(team_id), "last": int(last)})
-    raw = (data.get("response") or []) if isinstance(data, dict) else []
-    allowed = set(get_settings().enabled_league_ids)
-    out: list[dict] = []
-    for item in raw:
-        parsed = _parse_fixture(item, allowed or None)
-        if parsed and parsed["external_id"]:
-            out.append(parsed)
-    return out
+
+# --------------------------------------------------------------------------- #
+# 模块级业务函数（bot.py 使用的正式接口）
+# --------------------------------------------------------------------------- #
+
+async def fixtures_by_date(target: date) -> list[dict]:
+    """按日期获取比赛（已过滤 ENABLED_LEAGUES）。"""
+    return await FootballAPI().fixtures_by_date(target)
+
+
+async def team_fixtures(team_id: int, last: int = 20,
+                        allowed_leagues: Optional[set[int]] = None) -> list[dict]:
+    """按球队 ID 获取最近 ``last`` 场比赛（默认不限联赛，保证历史可用）。"""
+    return await FootballAPI().team_fixtures(team_id, last=last,
+                                             allowed_leagues=allowed_leagues)
 
 
 def upsert_fixtures(rows: list[dict]) -> int:
-    """按 ``external_id`` 更新或插入，返回新增/更新条数。"""
+    """按 ``external_id`` 更新或插入，返回新增/更新条数。Session 显式关闭。"""
     if not rows:
         return 0
     init_db()
     session = get_session()
+    count = 0
     try:
-        count = 0
         for r in rows:
             ext = r.get("external_id")
             if not ext:
@@ -210,44 +276,49 @@ def upsert_fixtures(rows: list[dict]) -> int:
             existing = session.query(Fixture).filter(Fixture.external_id == ext).one_or_none()
             if existing:
                 for k, v in r.items():
-                    if k == "id":
+                    if k in ("id", "external_id"):
                         continue
                     setattr(existing, k, v)
             else:
                 session.add(Fixture(**r))
             count += 1
         session.commit()
-        return count
+    except Exception:
+        session.rollback()
+        raise
     finally:
         session.close()
+    return count
 
 
-async def sync_date(target: date) -> tuple[int, list[Fixture]]:
-    """同步指定日期的比赛到数据库。返回 (写入条数, Fixture 列表)。
+def _day_window(target: date) -> tuple[datetime, datetime]:
+    """当天时间窗口（左闭右开）。
 
-    时间窗口取 [当天 00:00, 次日 00:00)，确保覆盖当天 23:xx 开赛的比赛，
-    不受 API 时区与本地时区差异影响。
+    数据库存的是 UTC 时间，与 API-Football ``date=`` 参数同一口径：
+    ``[target 00:00, target+1 00:00)``，确保覆盖当天 23:xx 开赛的比赛。
     """
-    from datetime import timedelta
     day_start = datetime(target.year, target.month, target.day)
-    day_end = day_start + timedelta(days=1)
+    return day_start, day_start + timedelta(days=1)
 
-    data = await _request_async("/fixtures", params={"date": target.isoformat()})
-    # _request_async 走同步 _request，返回 dict；这里统一解析
-    raw = (data.get("response") or []) if isinstance(data, dict) else []
-    allowed = set(get_settings().enabled_league_ids)
-    rows = [_parse_fixture(item, allowed or None) for item in raw]
-    rows = [r for r in rows if r and r.get("external_id")]
 
+async def sync_date(target: date) -> tuple[int, list[dict]]:
+    """同步指定日期的比赛到数据库。返回 ``(写入条数, 当天比赛行列表)``。
+
+    * 只保留 ENABLED_LEAGUES；
+    * 按 external_id 去重写入；
+    * 返回当天窗口内的全部比赛（行以 dict 形式给出，避免 Session 关闭后
+      触发 DetachedInstanceError）。
+    """
+    rows = await fixtures_by_date(target)
     written = upsert_fixtures(rows)
 
+    day_start, day_end = _day_window(target)
     session = get_session()
     try:
         fixtures = session.query(Fixture).filter(
             Fixture.start_time >= day_start,
             Fixture.start_time < day_end,
-        ).all()
-        # 脱离 session 使用：只拷贝数据列，避免携带 SQLAlchemy 实例状态
+        ).order_by(Fixture.start_time).all()
         result = [
             {c.name: getattr(f, c.name) for c in f.__table__.columns}
             for f in fixtures
@@ -258,26 +329,25 @@ async def sync_date(target: date) -> tuple[int, list[Fixture]]:
 
 
 async def sync_team_history(team_id: int, last: int = 20) -> int:
-    """同步某队的近期比赛到数据库（供 /predict 前补充历史数据）。返回写入条数。"""
+    """同步某队近期比赛，返回写入/更新条数。
+
+    说明：
+    * 不按联赛过滤，保证杯赛/跨联赛历史也能被预测器使用；
+    * 未结束（NS/TBD/…）的比赛同样入库，但预测器只统计已结束场次。
+    """
     if not team_id:
         return 0
-    rows = team_fixtures(team_id, last=last)
+    rows = await team_fixtures(team_id, last=last)
     return upsert_fixtures(rows)
 
 
-# 供 bot.py 按规范名称调用
+# 兼容别名
 sync_team_fixtures = sync_team_history
 
 
 __all__ = [
-    "FootballAPIError",
-    "_parse_time",
-    "_parse_fixture",
-    "_is_finished_status",
-    "fixtures_by_date",
-    "team_fixtures",
-    "upsert_fixtures",
-    "sync_date",
-    "sync_team_history",
-    "sync_team_fixtures",
+    "FootballAPIError", "FootballAPI",
+    "_parse_time", "_parse_fixture", "_is_finished_status", "_day_window",
+    "fixtures_by_date", "team_fixtures", "upsert_fixtures",
+    "sync_date", "sync_team_history", "sync_team_fixtures",
 ]

@@ -9,7 +9,8 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS = ROOT / "scripts"
 os.chdir(ROOT)
 sys.path.insert(0, str(ROOT))
 
@@ -154,7 +155,7 @@ def main():
     import subprocess
     env = {**os.environ, "PYTHONPATH": str(ROOT), "VERIFY_DB_PATH": str(_TMP / "idem.db")}
     proc = subprocess.run(
-        [sys.executable, str(ROOT / "verify_db.py")],
+        [sys.executable, str(SCRIPTS / "verify_db.py")],
         capture_output=True, text=True, cwd=str(ROOT), env=env,
     )
     if "DB_VERIFY_OK" not in proc.stdout:
@@ -199,7 +200,7 @@ def main():
         "import os, sys, asyncio, logging\n"
         "os.environ['TELEGRAM_BOT_TOKEN'] = ''\n"
         "os.environ['DATABASE_URL'] = {db_url!r}\n"
-        "from app.main import _run\n"
+        "from app.main import main\n"
         "called = {{'build': False}}\n"
         "def fake_build():\n"
         "    called['build'] = True\n"
@@ -214,7 +215,7 @@ def main():
         "h = _H(level=logging.ERROR)\n"
         "lg.addHandler(h); lg.setLevel(logging.ERROR)\n"
         "try:\n"
-        "    asyncio.run(_run())\n"
+        "    main()\n"
         "except (SystemExit, RuntimeError):\n"
         "    sys.exit(2 if called['build'] else 0)\n"
         "sys.exit(3)\n"
@@ -238,7 +239,7 @@ def main():
     print("\n=== 13. 根目录无异常杂散文件 ===")
     allowed = {
         "LICENSE", "README.md", "requirements.txt", ".env.example", ".gitignore",
-        "Dockerfile", "railway.toml", "verify_all.py", "verify_db.py",
+        "Dockerfile", "railway.toml", "scripts/verify_all.py", "scripts/verify_db.py",
     }
     stray = [
         p.name for p in Path(".").iterdir()
