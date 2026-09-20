@@ -1,28 +1,20 @@
-# 足球比赛赛程及预测 · Telegram Bot
+# 足球预测 Telegram 机器人 (MVP)
 
-一个基于 Python 3.11 的 Telegram 足球预测机器人 MVP：拉取 [API-Football](https://www.api-football.com/) 赛程，用 **Poisson 基线模型**计算胜/平/负概率、预期进球与最可能比分，通过 Telegram Bot 推送，结果存入 SQLite / PostgreSQL。
+基于 [API-Football](https://www.api-football.com/) 数据，用 Poisson 基线模型对足球比赛进行胜/平/负概率预测，并通过 Telegram Bot 推送。
 
-> ⚠️ 仅供数据分析参考，不构成投注建议。本项目**不保证盈利、命中率或预测结果**，也不含自动下注功能。
+> ⚠️ **仅供数据分析参考，不构成任何投注建议，不保证盈利或预测准确率。**
+
+---
 
 ## 功能
 
-- `python-telegram-bot` 运行 Bot（polling 模式）
-- API-Football 获取赛程与历史数据
-- SQLAlchemy 持久化（本地 SQLite，Railway 上 PostgreSQL）
-- Poisson 模型：主胜/平/客胜概率、预期进球、最可能比分、置信度、数据完整度、文字依据
-- **历史数据不足时拒绝预测**，防止强行输出
-- AI/LLM 功能预留接口但默认关闭，不影响核心流程
-
-## Telegram 命令
-
-| 命令 | 说明 |
-|------|------|
-| `/start` | 欢迎信息与命令列表 |
-| `/help` | 使用说明 |
-| `/today` | 同步并显示今日比赛 |
-| `/tomorrow` | 同步并显示明日比赛 |
-| `/predict` | 显示今日可预测比赛 |
-| `/status` | 运行状态、比赛数、模型版本 |
+- Telegram 命令：`/start` `/help` `/today` `/tomorrow` `/predict` `/status`
+- 通过 API-Football 拉取赛程，按 `ENABLED_LEAGUES` 过滤并入库（SQLite 本地 / PostgreSQL Railway）
+- **Poisson 基线模型**：主胜/平局/客胜概率、预期进球、最可能比分、置信度、数据完整度、文字依据
+- **样本不足时拒绝预测**（`MIN_HISTORY_MATCHES`，默认 5 场），绝不强行输出
+- 历史只用「已结束比赛」，防止未来数据泄漏
+- LLM 功能预留接口但默认关闭
+- 不自动下注
 
 ## 项目结构
 
@@ -36,95 +28,128 @@ football-prediction-telegram/
 ├── railway.toml
 ├── app/
 │   ├── __init__.py
-│   ├── config.py        # 环境变量配置
-│   ├── db.py            # SQLAlchemy 模型 + 引擎
-│   ├── data.py          # API-Football 客户端 + 入库
-│   ├── predictor.py     # Poisson 预测模型
+│   ├── config.py        # pydantic-settings，全部从环境变量读取
+│   ├── db.py            # SQLAlchemy：Fixture / Prediction 两张表
+│   ├── data.py          # API-Football 客户端 + 归一化
+│   ├── predictor.py     # Poisson 模型
 │   ├── bot.py           # Telegram 命令处理器
-│   └── main.py          # 入口 + 每日同步
+│   └── main.py          # 启动入口（polling）
 └── tests/
+    ├── conftest.py
     └── test_predictor.py
 ```
 
-## 本地运行
+## 快速开始（本地）
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+# 1. 准备环境
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-cp .env.example .env       # 填入下方环境变量
+# 2. 配置环境变量
+cp .env.example .env
+# 然后编辑 .env，填入 TELEGRAM_BOT_TOKEN 与 FOOTBALL_API_KEY
+
+# 3. 运行
 python -m app.main
 ```
 
 ## 环境变量
 
-复制 `.env.example` 为 `.env` 并填写：
-
-| 变量 | 说明 |
-|------|------|
-| `TELEGRAM_BOT_TOKEN` | @BotFather 创建的 Bot Token |
-| `TELEGRAM_ADMIN_CHAT_ID` | 管理员 Chat ID |
-| `FOOTBALL_API_KEY` | API-Football Key |
-| `FOOTBALL_API_BASE_URL` | 默认 `https://v3.football.api-sports.io` |
-| `DATABASE_URL` | 默认 `sqlite:///./football.db` |
-| `TIMEZONE` | 默认 `Asia/Shanghai` |
-| `ENABLED_LEAGUES` | 启用的联赛 ID，逗号分隔（默认 `39,140,135,78,61`） |
-| `MIN_HISTORY_MATCHES` | 单队最少历史场次，默认 `5` |
-| `PREDICTION_ENABLED` | `true/false` |
-| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | LLM（暂未启用，留空即可） |
-
-**严禁**将 `.env`、Token、API Key、数据库密码提交到仓库。
+| 变量 | 说明 | 是否必填 |
+|------|------|---------|
+| `TELEGRAM_BOT_TOKEN` | @BotFather 创建的 Bot Token | ✅ 生产必填 |
+| `TELEGRAM_ADMIN_CHAT_ID` | 管理员 Chat ID（预留） | 可选 |
+| `FOOTBALL_API_KEY` | API-Football API Key | ✅ 生产必填 |
+| `FOOTBALL_API_BASE_URL` | API 地址，默认 `https://v3.football.api-sports.io` | 默认即可 |
+| `DATABASE_URL` | 数据库连接，本地默认 SQLite；Railway 由 PostgreSQL 插件注入 | 见说明 |
+| `TIMEZONE` | 时区，默认 `Asia/Shanghai` | 可选 |
+| `ENABLED_LEAGUES` | 启用联赛 ID，逗号分隔，默认 `39,140,135,78,61` | 可选 |
+| `MIN_HISTORY_MATCHES` | 最低历史场次，默认 5 | 可选 |
+| `PREDICTION_ENABLED` | 是否开启预测，默认 true | 可选 |
+| `LLM_*` | LLM 配置，暂未启用，留空 | 可选 |
 
 ## 创建 Telegram Bot
 
-1. 在 Telegram 搜索 `@BotFather`，发送 `/newbot`
-2. 按提示设置名字与用户名，获得 **Bot Token**
-3. 填入 `TELEGRAM_BOT_TOKEN`
-4. 本地运行后向 Bot 发送 `/start` 测试
+1. Telegram 搜索 `@BotFather`，发送 `/newbot`
+2. 按提示设置名称（如 `Football Predictor`）和用户名（须以 `bot` 结尾）
+3. 保存返回的 Token → 填入 `TELEGRAM_BOT_TOKEN`
 
 ## 申请 API-Football Key
 
-1. 注册 https://www.api-football.com/ ，免费套餐足够 MVP 使用
-2. 在 Dashboard → API Key 获取 Key
+1. 注册 https://www.api-football.com/ （免费套餐 100 次/天，足够测试）
+2. 登录 Dashboard → API Key 复制
 3. 填入 `FOOTBALL_API_KEY`
 
 ## Railway 部署
 
-1. 将仓库推送到 GitHub
-2. 在 [Railway](https://railway.app/) 新建项目 → Deploy from GitHub → 选择本仓库
-3. Railway 会自动识别 `Dockerfile` 与 `railway.toml`
-4. 在 **Variables** 中添加以下环境变量（**不要写进仓库**）：
-   - `TELEGRAM_BOT_TOKEN`
-   - `TELEGRAM_ADMIN_CHAT_ID`
-   - `FOOTBALL_API_KEY`
-   - `DATABASE_URL`（见下方，Railway PostgreSQL 自动注入）
-   - `PREDICTION_ENABLED=true`
-5. 添加 PostgreSQL 插件，Railway 会自动注入 `DATABASE_URL`（`postgres://...`），代码自动转换为 `postgresql+psycopg://`
-6. 部署后查看日志确认 `Starting Telegram bot`
+1. 登录 https://railway.com/，New Project → **Deploy from GitHub Repo**
+2. 授权 GitHub，选择本仓库 `football-prediction-telegram`，分支 `main`
+3. Railway 自动识别 `Dockerfile` + `railway.toml`，构建命令为 `python -m app.main`
+4. 在同一 Project 点 **Add** → **Database** → **PostgreSQL**，等待创建
+5. 打开 PostgreSQL 服务的 Variables，复制 `DATABASE_URL`
+6. 打开机器人服务的 **Variables**，添加：
 
-### Railway PostgreSQL 配置
-
-- 在项目中 Add Service → Database → PostgreSQL
-- Railway 会自动设置环境变量 `DATABASE_URL`
-- 代码中的 `db.py` 会自动把 `postgres://` 转为 SQLAlchemy 驱动格式，无需手动修改
-
-## 测试
-
-```bash
-pytest -q
-python -m compileall app
+```
+TELEGRAM_BOT_TOKEN=你的Bot Token
+FOOTBALL_API_KEY=你的API-Football Key
+DATABASE_URL=上一步复制的PostgreSQL连接串
+ENABLED_LEAGUES=39,140,135,78,61
+MIN_HISTORY_MATCHES=5
+PREDICTION_ENABLED=true
+TIMEZONE=Asia/Shanghai
 ```
 
-测试不依赖真实 Telegram Token 或 API-Football Key。
+> 若 Railway 支持服务变量引用，可让机器人服务直接引用 PostgreSQL 的 `DATABASE_URL`，无需手动复制。
+
+7. 回到机器人服务，点 **Deploy / Redeploy**，查看 **Deployments → Logs**
+8. 正常启动日志：
+   ```
+   Initializing database...
+   Starting Telegram bot (polling)...
+   ```
+
+### 常见日志排查
+
+| 日志 | 原因 |
+|------|------|
+| `TELEGRAM_BOT_TOKEN 未配置` | Token 未注入机器人服务 Variables |
+| `FOOTBALL_API_KEY 未配置` | API Key 未注入（不影响 /start、/status，但 /predict 无数据） |
+| 数据库连接错误 | `DATABASE_URL` 未复制到机器人服务（仅存在于 PostgreSQL 服务不算注入） |
+
+## Telegram 测试命令
+
+```
+/start       → 欢迎信息与命令列表
+/help        → 使用说明
+/today       → 同步并显示今天比赛
+/tomorrow    → 同步并显示明天比赛
+/predict     → 对今天比赛生成预测（样本不足时提示「历史样本不足，暂不提供可靠预测」）
+/status      → 运行状态、比赛数、预测数、模型版本、配置联赛、时区
+```
 
 ## 安全说明
 
-- 所有凭据仅通过环境变量读取，`.env` 已在 `.gitignore`
-- 仓库中不含任何真实 Token / Key / 密码
-- 预测结果一律附带"仅供数据分析参考，不构成投注建议"
-- 不含自动下注逻辑
+- **严禁**将 `.env`、Token、API Key、数据库密码提交到 GitHub
+- 已通过 `.gitignore` 忽略 `.env`、`*.db` 等敏感文件
+- 推荐 Railway Variables 存放所有密钥，不在代码中硬编码
+- Token 若泄露，立即在 @BotFather / API-Football Dashboard 撤销并轮换
 
 ## 免责声明
 
-足球比赛结果具有高度不确定性。本项目的预测基于历史数据的统计模型，**不保证准确率、命中率或任何盈利**，仅供参考学习，不构成任何投注建议。请理性对待。
+本项目为技术演示，**不保证盈利、命中率或预测结果**。模型仅为 Poisson 基线，未考虑伤病、阵容、天气、盘口变化等因子，请理性看待。
+
+## 开发
+
+```bash
+# 运行测试
+pytest -q
+
+# 语法检查
+python -m compileall app
+
+# 检查空白/行尾问题
+git diff --check
+```
+
+测试不依赖真实 Telegram Token 或 API-Football Key（使用环境变量隔离 + 临时 SQLite）。

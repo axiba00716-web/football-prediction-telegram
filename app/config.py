@@ -1,5 +1,12 @@
-from pydantic_settings import BaseSettings
+"""配置：统一从环境变量 / .env 读取，全部使用大写变量名。"""
+
+from __future__ import annotations
+
+import os
 from functools import lru_cache
+from typing import Optional
+
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
@@ -17,13 +24,29 @@ class Settings(BaseSettings):
     LLM_MODEL: str = ""
     LOG_LEVEL: str = "INFO"
 
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        case_sensitive = True
+
     @property
     def enabled_league_ids(self) -> list[int]:
-        return [int(x) for x in self.ENABLED_LEAGUES.split(",") if x.strip()]
-
-    model_config = {"env_file": ".env", "case_sensitive": True, "extra": "ignore"}
+        """解析 ENABLED_LEAGUES 字符串为 int 列表，忽略空项。"""
+        if not self.ENABLED_LEAGUES:
+            return []
+        out: list[int] = []
+        for part in str(self.ENABLED_LEAGUES).split(","):
+            p = part.strip()
+            if p == "":
+                continue
+            try:
+                out.append(int(p))
+            except ValueError:
+                continue
+        return out
 
 
 @lru_cache()
 def get_settings() -> Settings:
+    """返回缓存的 Settings 单例（环境变量变更需重启进程）。"""
     return Settings()

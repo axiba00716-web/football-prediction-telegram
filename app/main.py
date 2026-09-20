@@ -1,43 +1,72 @@
-import logging
-import asyncio
-from datetime import date, timedelta
+"""入口：Railway / 本地启动 Telegram Bot（polling 模式）。
 
+生产行为
+--------
+* 无 TELEGRAM_BOT_TOKEN → 立即报错并退出（非零），**绝不**执行一次同步后假装正常。
+* 有 Token → 初始化 DB、构建 Application、持续 run_polling()（Railway 服务常驻）。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+
+from app.bot import build_application
 from app.config import get_settings
 from app.db import init_db
-from app.data import sync_date
-import app.bot as bot_module
 
-logging.basicConfig(
-    level=get_settings().LOG_LEVEL,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+
+def _configure_logging() -> None:
+    settings = get_settings()
+    level = getattr(logging, str(settings.LOG_LEVEL).upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        stream=sys.stdout,
+    )
+
+
+# 模块级 logger（测试可 monkeypatch 替换以捕获消息）
 logger = logging.getLogger(__name__)
 
 
-async def daily_sync():
-    """每日同步今天+明天比赛（供 Railway 定时调用）。"""
-    today = date.today()
-    for d in (today, today + timedelta(days=1)):
-        try:
-            count, _ = await sync_date(d)
-            logger.info("Synced %s: %d fixtures", d, count)
-        except Exception as e:
-            logger.error("Sync failed for %s: %s", d, e)
+async def _run() -> None:
+    _configure_logging()
+    global logger
+    logger = logging.getLogger(__name__)
 
-
-def main():
+    # 每次启动重新读取（测试/运行时可通过环境变量动态控制）
     settings = get_settings()
-    logger.info("Initializing database...")
-    init_db()
-
     if not settings.TELEGRAM_BOT_TOKEN:
-        # 无 Token 时（如 Railway 构建/测试阶段）仅跑同步，不启动 Bot
-        logger.warning("TELEGRAM_BOT_TOKEN 未配置，跳过 Bot 启动，仅执行每日同步。")
-        asyncio.run(daily_sync())
-        return
+        logger.error("缺少 TELEGRAM_BOT_TOKEN，无法启动 Telegram Bot。")
+        raise RuntimeError("缺少 TELEGRAM_BOT_TOKEN，无法启动 Telegram Bot。")
 
+    if not settings.FOOTBALL_API_KEY:
+        logger.warning(
+            "FOOTBALL_API_KEY 未配置：/today、/tomorrow、/predict 将无法拉取数据，"
+            "但机器人仍可启动并响应 /start、/status。"
+        )
+
+    init_db()
+    logger.info("Initializing database...")
+
+    app = build_application()
     logger.info("Starting Telegram bot (polling)...")
-    bot_module.run_polling()
+    await app.run_polling()  # 阻塞：服务持续运行
+
+
+def run_polling() -> None:
+    """供规范要求的 ``main`` 调用；内部即 _run 的同步驱动。"""
+    asyncio.run(_run())
+
+
+def main() -> None:
+    settings = get_settings()
+    if not settings.TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("缺少 TELEGRAM_BOT_TOKEN，无法启动 Telegram Bot。")
+    init_db()
+    run_polling()
 
 
 if __name__ == "__main__":
