@@ -12,3 +12,4 @@ env/
 htmlcov/
 models/
 *.log
+*.whl

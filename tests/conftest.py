@@ -36,6 +36,12 @@ def _isolate_env(monkeypatch, tmp_path):
     })
     tg.Update = object
     tg.ContextTypes = object
+
+    class BotCommand:
+        def __init__(self, command, description):
+            self.command = command
+            self.description = description
+    tg.BotCommand = BotCommand
     sys.modules["telegram"] = tg
     sys.modules["telegram.ext"] = te
 

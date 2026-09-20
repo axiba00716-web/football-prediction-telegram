@@ -181,3 +181,57 @@ def test_today_local_uses_configured_timezone(monkeypatch):
     monkeypatch.setenv("TIMEZONE", "Asia/Shanghai")
     from datetime import date
     assert isinstance(bot_mod.today_local(), date)
+
+
+class FakeApp:
+    """替身 Application。"""
+
+    def __init__(self):
+        self.handlers = []
+
+    def add_handler(self, h):
+        self.handlers.append(h)
+
+
+def test_bot_command_menu_covers_all_handlers():
+    """Telegram 斜杠菜单必须覆盖全部已注册命令，否则用户点不到。"""
+    import app.bot as bot_mod
+
+    app = FakeApp()
+    bot_mod.build_application(application=app)
+    registered = {h.command for h in app.handlers}
+    menu = {cmd for cmd, _desc in bot_mod.BOT_COMMANDS}
+    assert registered == menu, f"菜单与 handler 不一致：{registered ^ menu}"
+    assert all(desc for _c, desc in bot_mod.BOT_COMMANDS), "每条命令都要有中文说明"
+
+
+def test_set_bot_commands_is_resilient():
+    """菜单注册失败（如网络异常）不得抛出，避免影响机器人启动。"""
+    import asyncio
+
+    import app.bot as bot_mod
+
+    class BrokenApp:
+        class bot:
+            @staticmethod
+            async def set_my_commands(_cmds):
+                raise RuntimeError("Telegram API down")
+
+    asyncio.run(bot_mod._set_bot_commands(BrokenApp()))  # 不应抛异常
+
+
+def test_set_bot_commands_calls_api():
+    import asyncio
+
+    import app.bot as bot_mod
+
+    captured = {}
+
+    class OkApp:
+        class bot:
+            @staticmethod
+            async def set_my_commands(cmds):
+                captured["cmds"] = list(cmds)
+
+    asyncio.run(bot_mod._set_bot_commands(OkApp()))
+    assert len(captured["cmds"]) == len(bot_mod.BOT_COMMANDS)

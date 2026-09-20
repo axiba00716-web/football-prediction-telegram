@@ -192,6 +192,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/predict - 今日比赛预测\n"
         "/status - 运行状态\n"
         "/help - 使用说明\n\n"
+        "提示：点击输入框旁的菜单按钮（或输入 /）可直接选择命令，无需手打。\n\n"
         + DISCLAIMER
     ))
 
@@ -462,6 +463,29 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # 注册 / 构建 / 启动
 # --------------------------------------------------------------------------- #
 
+# Telegram 输入框旁的「斜杠菜单」：点 / 或菜单按钮即可选择命令
+BOT_COMMANDS: list[tuple[str, str]] = [
+    ("start", "欢迎信息与命令清单"),
+    ("today", "今天赛程（表格）"),
+    ("tomorrow", "明天赛程（表格）"),
+    ("predict", "今日比赛预测（表格）"),
+    ("status", "运行状态与数据库统计"),
+    ("help", "使用说明与免责声明"),
+]
+
+
+async def _set_bot_commands(application) -> None:
+    """启动时把命令菜单注册到 Telegram（用户在输入框点 / 即可选择）。"""
+    try:
+        from telegram import BotCommand
+        await application.bot.set_my_commands(
+            [BotCommand(cmd, desc) for cmd, desc in BOT_COMMANDS]
+        )
+        logger.info("已注册 %d 个 Telegram 命令菜单项", len(BOT_COMMANDS))
+    except Exception:  # noqa: BLE001 - 菜单注册失败不影响机器人运行
+        logger.warning("注册 Telegram 命令菜单失败（不影响使用）", exc_info=True)
+
+
 def register_handlers(application, CommandHandler=None) -> None:
     """注册全部命令处理器。CommandHandler 可注入（测试用）。"""
     if CommandHandler is None:
@@ -484,7 +508,12 @@ def build_application(application=None, CommandHandler=None) -> "Application":
         )
     init_db()
     if application is None:
-        application = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).build()
+        application = (
+            Application.builder()
+            .token(settings.TELEGRAM_BOT_TOKEN)
+            .post_init(_set_bot_commands)
+            .build()
+        )
     register_handlers(application, CommandHandler=CommandHandler)
     return application
 
@@ -496,8 +525,11 @@ def run_polling(drop_pending_updates: bool = True) -> None:
     application.run_polling(drop_pending_updates=drop_pending_updates)
 
 
+
+
 __all__ = [
     "start", "help_command", "today", "tomorrow", "predict", "status",
     "register_handlers", "build_application", "run_polling",
     "today_local", "DISCLAIMER", "FINISHED_STATUSES",
+    "BOT_COMMANDS", "_set_bot_commands",
 ]
