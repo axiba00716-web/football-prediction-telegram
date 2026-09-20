@@ -76,6 +76,7 @@ class PredictionResult:
     model_version: str = MODEL_VERSION
     home_team_id: Optional[int] = None
     away_team_id: Optional[int] = None
+    score_matrix: list = field(default_factory=list)  # [i][j] = 比分 i-j 的概率
     # 选择性出手：False 表示「有预测结果，但不建议参考」
     recommended: bool = True
     advice: str = ""
@@ -349,6 +350,7 @@ def predict_match(
         model_version=MODEL_VERSION,
         home_team_id=home_team_id,
         away_team_id=away_team_id,
+        score_matrix=matrix,
         recommended=recommended,
         advice=advice,
         elo_home=elo_home,
@@ -358,6 +360,53 @@ def predict_match(
         sample_games=total_games,
         reasons=reasons,
     )
+
+
+def attack_defense_probs(history: list[dict], home_team_id: int, away_team_id: int,
+                         league_avg: float = 1.35) -> Optional[tuple[float, float, float]]:
+    """第三路信号：经典「进攻强度 × 防守强度」Poisson，与主模型方法不同。
+
+    与 Elo / Dixon-Coles 并列，用于模型一致性投票（3/3 表示三路方向一致）。
+    任一队样本为 0 时返回 None（不参与投票，避免用默认值伪造一致性）。
+    """
+    h_gf, h_ga, h_n = _team_home_stats(history, home_team_id)
+    a_gf, a_ga, a_n = _team_away_stats(history, away_team_id)
+    if h_n == 0 or a_n == 0:
+        return None
+
+    # 主队进攻强度 vs 客队客场防守；客队进攻 vs 主队主场防守
+    home_attack = (h_gf / h_n) / league_avg
+    away_defense = (a_ga / a_n) / league_avg
+    away_attack = (a_gf / a_n) / league_avg
+    home_defense = (h_ga / h_n) / league_avg
+
+    lam_h = max(0.15, league_avg * home_attack * away_defense)
+    lam_a = max(0.15, league_avg * away_attack * home_defense)
+
+    hp = dp = ap = 0.0
+    for i in range(MAX_GOALS + 1):
+        for j in range(MAX_GOALS + 1):
+            pr = _poisson(lam_h, i) * _poisson(lam_a, j)
+            if i > j:
+                hp += pr
+            elif i < j:
+                ap += pr
+            else:
+                dp += pr
+    total = hp + dp + ap
+    if total <= 0:
+        return None
+    return hp / total, dp / total, ap / total
+
+
+def elo_signal_probs(elo_diff: float) -> tuple[float, float, float]:
+    """第一路信号：纯 Elo 分差 → 胜平负（logistic + 平局经验分布）。"""
+    home_win = 1.0 / (1.0 + 10.0 ** (-elo_diff / ELO_SCALE))
+    # 平局比例随双方接近而升高（经验近似，非校准值）
+    draw = 0.30 * (1.0 - abs(home_win - 0.5) * 2.0) + 0.08
+    draw = min(0.34, max(0.06, draw))
+    remain = 1.0 - draw
+    return home_win * remain, draw, (1.0 - home_win) * remain
 
 
 def format_prediction(result: PredictionResult) -> str:
@@ -380,4 +429,5 @@ def format_prediction(result: PredictionResult) -> str:
 __all__ = [
     "MODEL_VERSION", "PredictionResult", "predict_match", "format_prediction",
     "compute_elos", "_is_finished", "_dixon_coles_tau",
+    "attack_defense_probs", "elo_signal_probs",
 ]

@@ -62,12 +62,28 @@ class Prediction(Base):
 
     __tablename__ = "predictions"
     __table_args__ = (
-        UniqueConstraint("fixture_id", "model_version", name="uq_prediction_fixture_model"),
+        UniqueConstraint(
+            "fixture_id", "model_version", "prediction_type", "prediction_market",
+            name="uq_prediction_scope",
+        ),
     )
 
     id = Column(Integer, primary_key=True)
     fixture_id = Column(Integer, nullable=False, index=True)
     model_version = Column(String(40), default="")
+
+    # ---- 口径分离（关键）----
+    # full_1x2    全量胜平负（覆盖率 100%）
+    # selected_1x2 精选胜平负（高置信子集）
+    # binary      二分类市场
+    prediction_type = Column(String(20), default="full_1x2", index=True)
+    # 胜平负：home_win / draw / away_win
+    # 二分类：home_double_chance / away_double_chance / over_1_5 / under_4_5 / btts
+    prediction_market = Column(String(24), default="", index=True)
+    prediction_probability = Column(Float, default=0.0)
+    tier = Column(String(4), default="", index=True)        # A / B / C / ""
+    consistency = Column(String(8), default="")             # 如 "3/3"
+
     home_prob = Column(Float, default=0.0)
     draw_prob = Column(Float, default=0.0)
     away_prob = Column(Float, default=0.0)
@@ -78,7 +94,13 @@ class Prediction(Base):
     data_completeness = Column(Float, default=0.0)
     evidence = Column(Text, default="")
     created_at = Column(DateTime, default=datetime.utcnow)
-    settled = Column(Boolean, default=False)
+    feature_cutoff_at = Column(DateTime, nullable=True)     # 特征截止时间（防未来函数）
+
+    # ---- 赛后结算 ----
+    settled = Column(Boolean, default=False, index=True)
+    prediction_result = Column(String(20), default="")      # 实际结果
+    is_correct = Column(Boolean, nullable=True)
+    settled_at = Column(DateTime, nullable=True)
 
 
 # --------------------------------------------------------------------------- #

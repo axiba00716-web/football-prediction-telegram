@@ -88,7 +88,10 @@ def test_build_application_registers_all_commands(monkeypatch):
     built = bot_mod.build_application(application=app)
     assert built is app
     names = {h.command for h in app.handlers}
-    assert names == {"start", "help", "today", "tomorrow", "predict", "status"}
+    # 与 BOT_COMMANDS 菜单保持完全一致（菜单点得到 = 有处理器）
+    assert names == {cmd for cmd, _ in bot_mod.BOT_COMMANDS}
+    assert {"select", "binary", "report", "stats"} <= names, \
+        "三大口径命令必须已注册"
 
 
 def test_build_application_requires_token(monkeypatch):
