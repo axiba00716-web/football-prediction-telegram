@@ -4,11 +4,13 @@
 --------
 * 无 TELEGRAM_BOT_TOKEN → 立即报错并退出（非零），**绝不**执行一次同步后假装正常。
 * 有 Token → 初始化 DB、构建 Application、持续 run_polling()（Railway 服务常驻）。
+
+注意：python-telegram-bot 的 ``run_polling()`` 是**同步阻塞**方法，
+本模块不对其 ``await``，也不经 ``asyncio.run`` 包装，避免事件循环冲突。
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import sys
 
@@ -27,19 +29,15 @@ def _configure_logging() -> None:
     )
 
 
-# 模块级 logger（测试可 monkeypatch 替换以捕获消息）
 logger = logging.getLogger(__name__)
 
 
-async def _run() -> None:
+def run_polling() -> None:
+    """同步阻塞启动 Bot；调用方直接调用，不 await、不包 asyncio.run。"""
     _configure_logging()
-    global logger
-    logger = logging.getLogger(__name__)
 
-    # 每次启动重新读取（测试/运行时可通过环境变量动态控制）
     settings = get_settings()
     if not settings.TELEGRAM_BOT_TOKEN:
-        logger.error("缺少 TELEGRAM_BOT_TOKEN，无法启动 Telegram Bot。")
         raise RuntimeError("缺少 TELEGRAM_BOT_TOKEN，无法启动 Telegram Bot。")
 
     if not settings.FOOTBALL_API_KEY:
@@ -50,18 +48,14 @@ async def _run() -> None:
 
     init_db()
     logger.info("Initializing database...")
-
     app = build_application()
     logger.info("Starting Telegram bot (polling)...")
-    await app.run_polling()  # 阻塞：服务持续运行
-
-
-def run_polling() -> None:
-    """供规范要求的 ``main`` 调用；内部即 _run 的同步驱动。"""
-    asyncio.run(_run())
+    # 同步阻塞调用：run_polling() 自带事件循环，不应被 await
+    app.run_polling()
 
 
 def main() -> None:
+    """Railway / CLI 同步入口。"""
     settings = get_settings()
     if not settings.TELEGRAM_BOT_TOKEN:
         raise RuntimeError("缺少 TELEGRAM_BOT_TOKEN，无法启动 Telegram Bot。")

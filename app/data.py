@@ -35,7 +35,12 @@ class FootballAPIError(Exception):
 # --------------------------------------------------------------------------- #
 
 def _parse_time(value) -> Optional[datetime]:
-    """API 日期可能是 ISO 字符串或 datetime；统一归一化为 datetime。"""
+    """API 日期可能是 ISO 字符串或 datetime；统一归一化为 datetime。
+
+    API-Football 常见格式：``2026-09-20T15:00:00+00:00`` / ``...Z``，
+    优先用 ``datetime.fromisoformat`` 解析（Python 3.11+ 原生支持 ``Z`` 与偏移量），
+    失败时回退到显式 strptime 格式。解析失败返回 ``None``，由调用方决定是否丢弃该条比赛。
+    """
     if value is None:
         return None
     if isinstance(value, datetime):
@@ -43,10 +48,17 @@ def _parse_time(value) -> Optional[datetime]:
     if isinstance(value, date) and not isinstance(value, datetime):
         return datetime(value.year, value.month, value.day)
     if isinstance(value, str):
-        s = value.strip().replace("Z", "")
+        s = value.strip()
+        # 优先：fromisoformat（原生处理 +00:00 / Z 偏移，无需去除时区信息）
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+        # 回退：显式格式
+        s2 = s.replace("Z", "").replace("+00:00", "").strip()
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
             try:
-                return datetime.strptime(s, fmt)
+                return datetime.strptime(s2, fmt)
             except ValueError:
                 continue
     return None
@@ -211,24 +223,35 @@ def upsert_fixtures(rows: list[dict]) -> int:
 
 
 async def sync_date(target: date) -> tuple[int, list[Fixture]]:
-    """同步指定日期的比赛到数据库。返回 (写入条数, Fixture 列表)。"""
-    rows = await _request_async("/fixtures", params={"date": target.isoformat()})
-    # _request_async 返回的是 dict，需要解析
-    if isinstance(rows, dict):
-        raw = rows.get("response") or []
-        allowed = set(get_settings().enabled_league_ids)
-        rows = [_parse_fixture(item, allowed or None) for item in raw]
-        rows = [r for r in rows if r and r["external_id"]]
+    """同步指定日期的比赛到数据库。返回 (写入条数, Fixture 列表)。
+
+    时间窗口取 [当天 00:00, 次日 00:00)，确保覆盖当天 23:xx 开赛的比赛，
+    不受 API 时区与本地时区差异影响。
+    """
+    from datetime import timedelta
+    day_start = datetime(target.year, target.month, target.day)
+    day_end = day_start + timedelta(days=1)
+
+    data = await _request_async("/fixtures", params={"date": target.isoformat()})
+    # _request_async 走同步 _request，返回 dict；这里统一解析
+    raw = (data.get("response") or []) if isinstance(data, dict) else []
+    allowed = set(get_settings().enabled_league_ids)
+    rows = [_parse_fixture(item, allowed or None) for item in raw]
+    rows = [r for r in rows if r and r.get("external_id")]
+
     written = upsert_fixtures(rows)
 
     session = get_session()
     try:
         fixtures = session.query(Fixture).filter(
-            Fixture.start_time >= datetime(target.year, target.month, target.day),
-            Fixture.start_time < datetime(target.year, target.month, target.day, 23, 59, 59),
+            Fixture.start_time >= day_start,
+            Fixture.start_time < day_end,
         ).all()
-        # 脱离 session 使用，返回副本
-        result = [Fixture(**f.__dict__) for f in fixtures]
+        # 脱离 session 使用：只拷贝数据列，避免携带 SQLAlchemy 实例状态
+        result = [
+            {c.name: getattr(f, c.name) for c in f.__table__.columns}
+            for f in fixtures
+        ]
     finally:
         session.close()
     return written, result
@@ -248,12 +271,13 @@ sync_team_fixtures = sync_team_history
 
 __all__ = [
     "FootballAPIError",
+    "_parse_time",
+    "_parse_fixture",
+    "_is_finished_status",
     "fixtures_by_date",
     "team_fixtures",
     "upsert_fixtures",
     "sync_date",
     "sync_team_history",
     "sync_team_fixtures",
-    "_parse_fixture",
-    "_is_finished_status",
 ]
